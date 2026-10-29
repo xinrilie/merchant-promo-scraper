@@ -1,0 +1,3 @@
+# Complete development set. The launcher only validates; it never runs pip install.
+-r requirements.txt
+pytest>=8.0,<10

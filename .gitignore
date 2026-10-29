@@ -1,0 +1,23 @@
+# Python bytecode and local caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local virtual environments and secrets
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Generated pipeline outputs, scraping cache, and mutable local state
+output/
+runtime/
+state/
+
+# Temporary files
+*.tmp
+*.log
