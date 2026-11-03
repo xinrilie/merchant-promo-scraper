@@ -4284,7 +4284,7 @@ def current_source_run_metadata():
         fresh = as_int(stats.get("fresh_product_rows")) or 0
         if status == "preserved_previous" or (preserved > 0 and fresh == 0):
             output_status = "preserved_previous_catalog"
-        elif status == "fresh" and preserved > 0:
+        elif status in {"fresh", "fresh_with_preserved"} and preserved > 0:
             output_status = "mixed_fresh_and_preserved"
         elif status == "fresh":
             output_status = "updated"
