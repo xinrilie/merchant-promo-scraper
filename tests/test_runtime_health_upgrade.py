@@ -88,3 +88,23 @@ def test_health_summary_fails_when_all_sources_have_no_data():
     assert result["overall_status"] == "no_data"
     assert result["_exit_code"] == 2
     assert result["product_rows_in_source_outputs"] == 0
+
+
+def test_health_summary_exposes_promo_history_metrics_and_partial_status():
+    now = datetime(2026, 11, 3, 9, 0, tzinfo=JAKARTA)
+    log = {
+        "built_at": "2026-11-03T08:59:00+07:00",
+        "reference_date": "2026-11-03",
+        "promo_history": {"records_total": 120, "carried_forward_current_or_unverified": 12, "expired_records_retained_in_history": 45},
+        "source_health": {
+            "Hemat.id": {"status": "fresh_with_preserved", "product_rows_in_output": 20, "fresh_product_rows": 15, "preserved_previous_rows": 5},
+            "Katalogpromosi.com": {"status": "preserved_previous", "product_rows_in_output": 4, "preserved_previous_rows": 4},
+            "Scanharga.com": {"status": "fresh", "product_rows_in_output": 9, "fresh_product_rows": 9},
+        },
+    }
+    result = build_summary(log, now=now)
+    assert result["overall_status"] == "partial"
+    assert result["promo_history"]["records_total"] == 120
+    assert result["promo_history"]["expired_records_retained_in_history"] == 45
+    assert result["sources"]["Hemat.id"]["health"] == "healthy_with_warnings"
+    assert result["_exit_code"] == 0
