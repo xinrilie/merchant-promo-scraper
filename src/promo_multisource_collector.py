@@ -31,11 +31,18 @@ from promo_merchant_utils import infer_merchant_candidate_from_title, infer_merc
 from promo_product_validation import product_candidate_rejection_reason, product_candidate_review_reason
 from promo_evidence import find_amount_evidence, find_discount_evidence, extract_period_evidence
 from promo_categories import classify_promo_category
+from promo_history import (
+    load_history, seed_history_from_snapshot, merge_snapshot_into_history,
+    update_history, carry_forward_rows, save_history, export_history_csv,
+)
 
 ENGINE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = ENGINE_DIR.parent
 RUNTIME_DIR = ROOT_DIR / "runtime"
 OUTPUT_DIR = ROOT_DIR / "output"
+STATE_DIR = ROOT_DIR / "state"
+HISTORY_PATH = STATE_DIR / "promo_history.csv"
+OUT_HISTORY = OUTPUT_DIR / "Riwayat_Promo.csv"
 TZ = ZoneInfo("Asia/Jakarta")
 TODAY = datetime.now(TZ).date()
 
@@ -158,6 +165,10 @@ PRODUCT_FIELDS = [
     "promo_price_evidence_text", "normal_price_evidence_text", "discount_evidence_text",
     "period_evidence_text", "period_evidence_source",
     "raw_line", "retained_from_previous_run", "product_validation_status", "product_review_reason",
+    "history_id", "first_seen_at", "last_seen_at", "last_seen_run_id", "seen_count",
+    "presence_status", "history_promo_status", "history_record_status",
+    "days_since_last_seen", "history_source_names", "history_source_urls",
+    "superseded_by_history_id", "retention_reason",
 ]
 ACTIVE_FIELDS = PRODUCT_FIELDS
 REVIEW_FIELDS = PRODUCT_FIELDS + ["review_reason"]
@@ -1332,10 +1343,14 @@ def dedupe_rows(rows: list[dict]) -> list[dict]:
 
 
 def write_csv(path: Path, rows: list[dict], fields: list[str]) -> None:
-    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+    """Atomically write a CSV so an interrupted run cannot truncate last-good data."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+    temp.replace(path)
 
 
 def row_review_reason(row: dict) -> str | None:
@@ -1360,7 +1375,10 @@ def row_review_reason(row: dict) -> str | None:
 
 
 def write_json(path: Path, payload: dict) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
 
 
 def read_previous_product_rows(path: Path) -> list[dict]:
@@ -1394,7 +1412,9 @@ def build_source_health_report(source_names, products, request_log) -> dict:
         period_rows = [item for item in source_products if item.get("promo_status") in {"active", "active_estimated", "upcoming", "upcoming_estimated"}]
         ok_requests = sum(item.get("status") == "ok" for item in source_requests)
         retained = len(source_products) - len(fresh_source_products)
-        if fresh_source_products and ok_requests:
+        if fresh_source_products and retained:
+            status = "fresh_with_preserved"
+        elif fresh_source_products and ok_requests:
             status = "fresh"
         elif source_products and not fresh_source_products:
             status = "preserved_previous"
@@ -1512,6 +1532,7 @@ def main() -> None:
         run_self_tests()
         return
 
+    REJECTED_PRODUCT_CANDIDATES.clear()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     session = requests.Session()
@@ -1521,55 +1542,129 @@ def main() -> None:
         "Accept-Language": "id-ID,id;q=0.9,en;q=0.8",
     })
 
-    # Keep last-good data available in case an upstream page goes temporarily empty,
-    # is blocked, or changes its HTML structure.
+    # Persistent promo history is independent from the current snapshot. On the
+    # first run after upgrading, migrate the last-good snapshot into state/ once.
     previous_products = read_previous_product_rows(OUT_ALL)
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if HISTORY_PATH.exists():
+        history_rows = load_history(HISTORY_PATH)
+        history_rows = merge_snapshot_into_history(
+            history_rows, previous_products, now=datetime.now(TZ), today=TODAY
+        )
+        history_init = "existing_with_snapshot_backfill"
+    else:
+        history_rows = seed_history_from_snapshot(previous_products, now=datetime.now(TZ), today=TODAY)
+        history_init = "seeded_from_previous_snapshot" if history_rows else "created_empty"
+
     all_products: list[dict] = []
     all_articles: list[dict] = []
     all_images: list[dict] = []
     request_log: list[dict] = []
-    preserved_previous_rows_by_source: dict[str, int] = {}
     fresh_rows_by_source: Counter = Counter()
+    run_id = datetime.now(TZ).strftime("%Y%m%dT%H%M%S%z")
 
     try:
         for source_name in SOURCE_SEEDS:
             try:
-                products, articles, images, log = run_source(session, source_name)
-                all_products.extend(products)
+                source_products, articles, images, log = run_source(session, source_name)
+                all_products.extend(source_products)
                 all_articles.extend(articles)
                 all_images.extend(images)
                 request_log.extend(log)
-                say(f"[{source_name}] produk={len(products)}, artikel={len(articles)}, gambar={len(images)}")
+                say(f"[{source_name}] produk={len(source_products)}, artikel={len(articles)}, gambar={len(images)}")
             except KeyboardInterrupt:
                 raise
             except Exception as exc:
                 request_log.append({"source_name": source_name, "phase": "source", "status": "error", "error": f"{type(exc).__name__}: {exc}"})
                 say(f"[{source_name}] error: {type(exc).__name__}: {exc}")
 
-        # If an individual source yields no textual products in this run, preserve its
-        # last-good product rows. This avoids wiping a source because of a temporary
-        # outage or HTML-layout change. Their original scraped_at remains visible for audit.
-        fresh_rows_by_source = Counter(clean_text(row.get("source_name")) for row in all_products if row.get("source_name"))
-        for source_name in SOURCE_SEEDS:
-            if fresh_rows_by_source.get(source_name, 0) > 0:
-                continue
-            source_previous = [row for row in previous_products if source_name in sources_in_row(row)]
-            if source_previous:
-                for previous in source_previous:
-                    retained = dict(previous)
-                    retained["retained_from_previous_run"] = "true"
-                    # Preserve the old source name so downstream auditing can identify the fallback.
-                    all_products.append(retained)
-                preserved_previous_rows_by_source[source_name] = len(source_previous)
+        # Only actually scraped records count as fresh observations. Source rows
+        # previously retained in the snapshot are never treated as new sightings.
+        fresh_rows_by_source = Counter(
+            clean_text(row.get("source_name"))
+            for row in all_products
+            if row.get("source_name")
+            and str(row.get("retained_from_previous_run", "")).casefold() not in {"true", "1", "yes"}
+        )
+        fresh_products = dedupe_rows(all_products)
+        for row in fresh_products:
+            row["retained_from_previous_run"] = False
 
-        # Exact cross-source deduplication only; differing dates/prices remain separate and traceable.
-        products = dedupe_rows(all_products)
+        # Upsert current observations. Repeated executions update last_seen_at and
+        # seen_count; they do not append duplicate history records.
+        history_rows = update_history(
+            history_rows, fresh_products, run_id=run_id, now=datetime.now(TZ), today=TODAY
+        )
+        save_history(HISTORY_PATH, history_rows)
+        export_history_csv(OUT_HISTORY, history_rows)
+
+        # Carry forward previously observed, still-valid offers that did not appear
+        # in this scrape. Unknown-period rows receive only a 14-day review grace.
+        carried_products = carry_forward_rows(history_rows, fresh_products, today=TODAY)
+        products = dedupe_rows(fresh_products + carried_products)
         for row in products:
             row.setdefault("retained_from_previous_run", False)
             row["review_reason"] = row_review_reason(row)
 
         active = [r for r in products if r.get("promo_status") in {"active", "active_estimated"} and r.get("product_validation_status") != "review"]
         review = [r for r in products if r.get("review_reason") or r.get("product_validation_status") == "review"]
+
+        source_health = build_source_health_report(SOURCE_SEEDS, products, request_log)
+
+        report = {
+            "built_at": now_iso(),
+            "reference_date": TODAY.isoformat(),
+            "run_id": run_id,
+            "promo_history": {
+                "path": HISTORY_PATH.relative_to(ROOT_DIR).as_posix(),
+                "export_path": OUT_HISTORY.relative_to(ROOT_DIR).as_posix(),
+                "initialization": history_init,
+                "records_total": len(history_rows),
+                "fresh_observations_this_run": len(fresh_products),
+                "carried_forward_current_or_unverified": len(carried_products),
+                "expired_records_retained_in_history": sum(1 for row in history_rows if row.get("history_promo_status") == "expired"),
+                "superseded_records_retained_in_history": sum(1 for row in history_rows if row.get("history_record_status") == "superseded"),
+            },
+            "sources": list(SOURCE_SEEDS),
+            "source_health": source_health,
+            "article_selection_policy": (
+                "Prioritize active/current and upcoming periods parsed from visible article titles; "
+                "month-only periods are estimates; permalink year is not treated as freshness evidence."
+            ),
+            "request_count": len(request_log),
+            "successful_requests": sum(1 for x in request_log if x.get("status") == "ok"),
+            "blocked_or_limited_requests": sum(1 for x in request_log if x.get("status") == "blocked_or_limited"),
+            "fresh_product_rows_before_carry_forward": sum(fresh_rows_by_source.values()),
+            "carried_forward_rows": len(carried_products),
+            "all_product_rows_before_dedup": len(fresh_products) + len(carried_products),
+            "product_rows_after_exact_dedup": len(products),
+            "active_rows_including_end_date_estimates": len(active),
+            "review_rows": len(review),
+            "merchant_counts": dict(Counter(r.get("merchant_name") or "UNKNOWN" for r in active)),
+            "rows_by_source": dict(Counter(r.get("source_name") or "UNKNOWN" for r in products)),
+            "rows_with_explicit_discount": sum(r.get("discount_basis") == "source_explicit_product_claim" for r in products),
+            "rows_with_price_calculated_discount": sum(r.get("discount_basis") == "calculated_from_prices" for r in products),
+            "image_references_found": len(all_images),
+            "rejected_non_product_candidates": len(REJECTED_PRODUCT_CANDIDATES),
+            "rejection_reasons": dict(Counter(x.get("rejection_reason", "unknown") for x in REJECTED_PRODUCT_CANDIDATES)),
+            "output_files": [OUT_ALL.name, OUT_ACTIVE.name, OUT_REVIEW.name, OUT_ARTICLES.name, OUT_IMAGES.name, OUT_REJECTED_CANDIDATES.name, OUT_LOG.name, OUT_HISTORY.name],
+            "limitations": [
+                "Data aggregator diberi verification_status=aggregator_only; bukan verifikasi resmi retailer.",
+                "URL poster/gambar promo dicatat di promo_multisource_catalog_images.csv sebagai referensi visual; gambar tidak diunduh untuk membaca teks atau harga.",
+                "Artikel tanpa periode eksplisit dapat berstatus active_estimated atau unknown dan perlu diperiksa.",
+                "Situs yang mengembalikan 401/403/429 tidak dicoba dilewati.",
+            ],
+            "request_log": request_log,
+        }
+        if not products:
+            # The history is safely updated, but never replace the last-good
+            # current snapshot with an empty file after a source outage.
+            report["current_snapshot_preserved"] = True
+            write_json(OUT_LOG, report)
+            raise RuntimeError(
+                "Tidak ada promo baru atau carry-forward yang masih layak ditampilkan. "
+                "Snapshot katalog sebelumnya dipertahankan; periksa runtime/source_health dan output/Riwayat_Promo.csv."
+            )
 
         write_csv(OUT_ALL, products, PRODUCT_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id", "review_reason"])
         write_csv(OUT_ACTIVE, active, ACTIVE_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id"])
@@ -1580,48 +1675,13 @@ def main() -> None:
             "source_name", "campaign_title", "source_url", "source_item_url",
             "raw_line", "product_text", "offer_text", "rejection_reason", "scraped_at",
         ])
-
-        source_health = build_source_health_report(SOURCE_SEEDS, all_products, request_log)
-
-        report = {
-            "built_at": now_iso(),
-            "reference_date": TODAY.isoformat(),
-            "sources": list(SOURCE_SEEDS),
-            "source_health": source_health,
-            "article_selection_policy": (
-                "Prioritize active/current and upcoming periods parsed from visible article titles; "
-                "month-only periods are estimates; permalink year is not treated as freshness evidence."
-            ),
-            "request_count": len(request_log),
-            "successful_requests": sum(1 for x in request_log if x.get("status") == "ok"),
-            "blocked_or_limited_requests": sum(1 for x in request_log if x.get("status") == "blocked_or_limited"),
-            "fresh_product_rows_before_fallback": sum(fresh_rows_by_source.values()),
-            "preserved_previous_rows_by_source": preserved_previous_rows_by_source,
-            "all_product_rows_before_dedup": len(all_products),
-            "product_rows_after_exact_dedup": len(products),
-            "active_rows_including_end_date_estimates": len(active),
-            "review_rows": len(review),
-            "merchant_counts": dict(Counter(r.get("merchant_name") or "UNKNOWN" for r in active)),
-            "rows_by_source": dict(Counter(r.get("source_name") or "UNKNOWN" for r in all_products)),
-            "rows_with_explicit_discount": sum(r.get("discount_basis") == "source_explicit_product_claim" for r in products),
-            "rows_with_price_calculated_discount": sum(r.get("discount_basis") == "calculated_from_prices" for r in products),
-            "image_references_found": len(all_images),
-            "rejected_non_product_candidates": len(REJECTED_PRODUCT_CANDIDATES),
-            "rejection_reasons": dict(Counter(x.get("rejection_reason", "unknown") for x in REJECTED_PRODUCT_CANDIDATES)),
-            "output_files": [OUT_ALL.name, OUT_ACTIVE.name, OUT_REVIEW.name, OUT_ARTICLES.name, OUT_IMAGES.name, OUT_REJECTED_CANDIDATES.name, OUT_LOG.name],
-            "limitations": [
-                "Data aggregator diberi verification_status=aggregator_only; bukan verifikasi resmi retailer.",
-                "URL poster/gambar promo dicatat di promo_multisource_catalog_images.csv sebagai referensi visual; gambar tidak diunduh untuk membaca teks atau harga.",
-                "Artikel tanpa periode eksplisit dapat berstatus active_estimated atau unknown dan perlu diperiksa.",
-                "Situs yang mengembalikan 401/403/429 tidak dicoba dilewati.",
-            ],
-            "request_log": request_log,
-        }
         write_json(OUT_LOG, report)
         say("\nSELESAI - MULTI-SOURCE PROMO COLLECTOR")
         say(f"Baris baru hasil scrape   : {sum(fresh_rows_by_source.values())}")
-        say(f"Baris lama dipertahankan  : {sum(preserved_previous_rows_by_source.values())}")
-        say(f"Produk sebelum deduplikasi : {len(all_products)}")
+        say(f"Baris lama dipertahankan  : {len(carried_products)}")
+        say(f"Riwayat promo tersimpan   : {len(history_rows)}")
+        say(f"Riwayat promo expired     : {sum(1 for row in history_rows if row.get('history_promo_status') == 'expired')}")
+        say(f"Produk sebelum deduplikasi : {len(fresh_products) + len(carried_products)}")
         say(f"Produk setelah deduplikasi: {len(products)}")
         say(f"Promo aktif/estimasi      : {len(active)}")
         say(f"Baris perlu review        : {len(review)}")
@@ -1629,6 +1689,7 @@ def main() -> None:
         say(f"Kandidat non-produk ditolak: {len(REJECTED_PRODUCT_CANDIDATES)}")
         say(f"Data teknis tersimpan     : {RUNTIME_DIR.name}/")
         say(f"Katalog akhir             : {OUTPUT_DIR.name}/Katalog_Promo_Final.xlsx dan .csv")
+        say(f"Riwayat seluruh promo     : {OUT_HISTORY.relative_to(ROOT_DIR)}")
     finally:
         session.close()
 
