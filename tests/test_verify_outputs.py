@@ -17,6 +17,13 @@ def _write_valid_outputs(root: Path) -> None:
     workbook.active.title = "Katalog"
     workbook.save(root / "output" / "Katalog_Promo_Final.xlsx")
 
+    with (root / "output" / "Riwayat_Promo.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["history_id", "product_text"])
+        writer.writerow(["history-1", "Contoh Produk"])
+
     with (root / "output" / "Katalog_Promo_Final.csv").open(
         "w", encoding="utf-8", newline=""
     ) as handle:
@@ -45,7 +52,7 @@ def test_verify_outputs_succeeds_in_project_path_with_spaces(tmp_path):
     assert report["ok"] is True
     assert report["errors"] == []
     assert report["sheets"] == ["Katalog"]
-    assert set(report["files"]) == {"workbook", "catalog_csv", "image_index", "source_health"}
+    assert set(report["files"]) == {"workbook", "catalog_csv", "promo_history", "image_index", "source_health"}
     assert all(item["ok"] for item in report["files"].values())
 
 
