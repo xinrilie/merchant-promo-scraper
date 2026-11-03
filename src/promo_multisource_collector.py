@@ -54,8 +54,6 @@ MAX_ARTICLES_PER_SOURCE = 30
 MAX_IMAGES_PER_ARTICLE = 20
 
 OUT_ALL = RUNTIME_DIR / "promo_multisource_products_all.csv"
-OUT_ACTIVE = RUNTIME_DIR / "promo_multisource_products_active.csv"
-OUT_REVIEW = RUNTIME_DIR / "promo_multisource_products_review.csv"
 OUT_ARTICLES = RUNTIME_DIR / "promo_multisource_articles.csv"
 OUT_IMAGES = RUNTIME_DIR / "promo_multisource_catalog_images.csv"
 OUT_LOG = RUNTIME_DIR / "promo_multisource_runlog.json"
@@ -63,9 +61,17 @@ OUT_REJECTED_CANDIDATES = RUNTIME_DIR / "promo_multisource_rejected_candidates.c
 REJECTED_PRODUCT_CANDIDATES: list[dict] = []
 
 SOURCE_SEEDS = {
+    # Use a single-retailer page for each seed. Combined paths such as
+    # /katalog-alfamart,superindo/ are comparison pages and make the source URL
+    # look as if one offer came from a multi-retailer listing.
     "Hemat.id": [
         "https://www.hemat.id/katalog-alfamart/",
-        "https://www.hemat.id/katalog-alfamart,indomaret/promo-promo/",
+        "https://www.hemat.id/katalog-indomaret/",
+        "https://www.hemat.id/katalog-alfamidi/",
+        "https://www.hemat.id/katalog-superindo/",
+        "https://www.hemat.id/katalog-hypermart/",
+        "https://www.hemat.id/katalog-yogya/",
+        "https://www.hemat.id/katalog-tip-top/",
     ],
     "Katalogpromosi.com": [
         "https://katalogpromosi.com/",
@@ -170,8 +176,6 @@ PRODUCT_FIELDS = [
     "days_since_last_seen", "history_source_names", "history_source_urls",
     "superseded_by_history_id", "retention_reason",
 ]
-ACTIVE_FIELDS = PRODUCT_FIELDS
-REVIEW_FIELDS = PRODUCT_FIELDS + ["review_reason"]
 ARTICLE_FIELDS = [
     "source_name", "title", "source_url", "published_at", "merchant_name",
     "valid_from", "valid_until", "period_precision", "promo_status",
@@ -1077,7 +1081,19 @@ def is_listing_link(source_name: str, url: str, text: str) -> bool:
     path = urlparse(url).path.lower()
     txt = clean_text(text).casefold()
     if source_name == "Hemat.id":
-        return any(mark in path for mark in ("/katalog-", "/promo-promo/")) or bool(re.search(r"/page/\d+/?$", path)) or "promo halaman" in txt
+        # Follow only single-retailer catalogue pages. Hemat comparison URLs
+        # encode several retailers in one slug, e.g. /katalog-alfamart,yogya/.
+        parts = [part for part in path.strip("/").split("/") if part]
+        if parts and parts[0].startswith("katalog-"):
+            retailer_slug = parts[0][len("katalog-"):]
+            allowed_retailers = {
+                "alfamart", "indomaret", "alfamidi", "superindo",
+                "hypermart", "yogya", "tip-top",
+            }
+            if retailer_slug not in allowed_retailers:
+                return False
+            return len(parts) == 1 or (len(parts) == 2 and parts[1] == "promo-promo")
+        return bool(re.fullmatch(r"/page/\d+/?", path))
     if source_name == "Katalogpromosi.com":
         return (
             bool(re.search(r"/page/\d+/?$", path))
@@ -1647,7 +1663,7 @@ def main() -> None:
             "image_references_found": len(all_images),
             "rejected_non_product_candidates": len(REJECTED_PRODUCT_CANDIDATES),
             "rejection_reasons": dict(Counter(x.get("rejection_reason", "unknown") for x in REJECTED_PRODUCT_CANDIDATES)),
-            "output_files": [OUT_ALL.name, OUT_ACTIVE.name, OUT_REVIEW.name, OUT_ARTICLES.name, OUT_IMAGES.name, OUT_REJECTED_CANDIDATES.name, OUT_LOG.name, OUT_HISTORY.name],
+            "output_files": [OUT_ALL.name, OUT_ARTICLES.name, OUT_IMAGES.name, OUT_REJECTED_CANDIDATES.name, OUT_LOG.name, OUT_HISTORY.name],
             "limitations": [
                 "Data aggregator diberi verification_status=aggregator_only; bukan verifikasi resmi retailer.",
                 "URL poster/gambar promo dicatat di promo_multisource_catalog_images.csv sebagai referensi visual; gambar tidak diunduh untuk membaca teks atau harga.",
@@ -1667,8 +1683,6 @@ def main() -> None:
             )
 
         write_csv(OUT_ALL, products, PRODUCT_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id", "review_reason"])
-        write_csv(OUT_ACTIVE, active, ACTIVE_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id"])
-        write_csv(OUT_REVIEW, review, REVIEW_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id"])
         write_csv(OUT_ARTICLES, all_articles, ARTICLE_FIELDS)
         write_csv(OUT_IMAGES, all_images, IMAGE_FIELDS)
         write_csv(OUT_REJECTED_CANDIDATES, REJECTED_PRODUCT_CANDIDATES, [

@@ -9,6 +9,7 @@ from collections import Counter, OrderedDict, defaultdict
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from urllib.parse import urlparse
 import math
 
 from promo_names import (
@@ -2592,7 +2593,7 @@ CLEAN_COLUMNS = [
     ("Detail Penawaran", "offer_text"),
     ("Kampanye", "campaign_title"),
     ("Catatan", "display_notes"),
-    ("Sumber URL", "source_url"),
+    ("Sumber URL", "display_source_url"),
 ]
 
 
@@ -2657,8 +2658,54 @@ def clean_sort_key(row):
     return (-discount, (row.get("Merchant") or "").casefold(), (row.get("Nama Produk") or "").casefold())
 
 
+HEMAT_RETAILER_CATALOG_URLS = {
+    "alfamart": "https://www.hemat.id/katalog-alfamart/",
+    "indomaret": "https://www.hemat.id/katalog-indomaret/",
+    "alfamidi": "https://www.hemat.id/katalog-alfamidi/",
+    "super indo": "https://www.hemat.id/katalog-superindo/",
+    "superindo": "https://www.hemat.id/katalog-superindo/",
+    "hypermart": "https://www.hemat.id/katalog-hypermart/",
+    "yogya": "https://www.hemat.id/katalog-yogya/",
+    "tip top": "https://www.hemat.id/katalog-tip-top/",
+    "tiptop": "https://www.hemat.id/katalog-tip-top/",
+}
+
+
+def preferred_source_url(row):
+    """Prefer a product detail URL; keep legacy comparison pages out of the main catalog link."""
+    item_url = str(row.get("source_item_url") or "").strip()
+    if item_url:
+        parsed_item = urlparse(item_url)
+        item_path = parsed_item.path.lower()
+        is_specific_hemat_item = (
+            (parsed_item.hostname or "").lower().removeprefix("www.") == "hemat.id"
+            and (
+                item_path.startswith("/harga/")
+                or item_path.startswith("/harga-")
+                or bool(re.fullmatch(r"/katalog/[^/]+/", item_path))
+            )
+        )
+        if is_specific_hemat_item:
+            return item_url
+
+    source_url = str(row.get("source_url") or row.get("source_page_url") or "").strip()
+    parsed_source = urlparse(source_url)
+    source_path = parsed_source.path.lower()
+    is_hemat_comparison = (
+        (parsed_source.hostname or "").lower().removeprefix("www.") == "hemat.id"
+        and bool(re.search(r"/katalog-[^/]*,[^/]*/", source_path))
+    )
+    if is_hemat_comparison:
+        merchant = re.sub(r"\s+", " ", str(row.get("merchant_name") or "").strip().casefold())
+        canonical = HEMAT_RETAILER_CATALOG_URLS.get(merchant)
+        if canonical:
+            return canonical
+    return source_url or item_url
+
+
 def make_clean_row(row, review=False):
     item = dict(row)
+    item["display_source_url"] = preferred_source_url(row)
     item["display_status"] = display_status(row)
     item["product_quality_label"] = product_validation_display(row)
     item["display_deal_type"] = row.get("deal_type") or row.get("campaign_type") or ""
@@ -3355,7 +3402,7 @@ def make_simple_excel_row(row):
         "Penawaran": offer or "—",
         "Status Promo": display_status(row),
         "Verifikasi Sumber": row.get("source_verification_label") or source_verification_label(row.get("verification_status")),
-        "Sumber URL": row.get("source_url") or "",
+        "Sumber URL": clean.get("Sumber URL") or "",
         "_discount_numeric": isinstance(discount_cell, (int, float)),
         "_discount_basis": calculation_basis or existing_basis,
         "_review_required": (
