@@ -56,6 +56,24 @@ Jalankan tes, scraping teks/HTML, health-check, konsolidasi, dan ekspor katalog:
 run.bat
 ```
 
+## Riwayat promo: snapshot versus history
+
+Versi ini memisahkan **snapshot katalog berjalan** dari **riwayat promo permanen**:
+
+- `runtime/promo_multisource_products_all.csv` berisi promo yang baru ditemukan dan promo lama yang masih layak dibawa ke snapshot.
+- `state/promo_history.csv` adalah database permanen seluruh versi penawaran yang pernah ditemukan. Record di-upsert berdasarkan identitas produk, merchant, periode, harga, dan syarat penawaran; run berulang tidak membuat salinan identik.
+- `output/Riwayat_Promo.csv` adalah ekspor yang mudah dibuka dari database riwayat. Promo `expired` dan versi `superseded` tetap ada di sini, bukan di daftar promo berjalan. Kolom `history_status_as_of` menunjukkan tanggal status itu dihitung.
+
+Aturan retensi:
+
+1. Promo yang tidak ditemukan pada scrape terbaru tetap dibawa ke snapshot selama tanggal akhirnya belum lewat. Baris ditandai `retained_from_previous_run` sehingga freshness tetap terlihat.
+2. Promo tanpa periode yang dapat dipastikan hanya dibawa maksimal 14 hari sejak observasi terakhir dan tetap berstatus `unknown`/review.
+3. Promo yang sudah melewati tanggal akhir tidak masuk snapshot berjalan, tetapi tetap disimpan dengan `history_promo_status=expired`.
+4. Jika produk, merchant, dan periode sama muncul lagi dengan harga/penawaran berbeda, versi lama ditandai `superseded` dan versi terbaru dipakai untuk snapshot.
+5. Jika semua sumber gagal dan tidak ada data yang masih layak dibawa, snapshot terakhir tidak ditimpa file kosong. Riwayat tetap disimpan.
+
+Pada upgrade pertama, jika `state/promo_history.csv` belum ada, collector memigrasikan `runtime/promo_multisource_products_all.csv` yang lama satu kali. Agar data lama tidak hilang saat pindah ke repo bersih, pulihkan folder `runtime/`, `state/`, dan `output/` dari backup lokal **sebelum menjalankan `run.bat` pertama kali**. Jangan commit folder-folder tersebut ke GitHub.
+
 ## Database harga: seed versus state
 
 `data/product_price_reference.csv` adalah snapshot awal yang dikemas bersama proyek. Pada run pertama, file ini disalin satu kali menjadi `state/product_price_reference.csv`. Observasi harga normal yang baru dari scraping hanya menulis ke file di `state/`, sehingga menjalankan scraper tidak mengubah CSV seed yang dilacak Git. Jika file state sudah ada, program mempertahankannya dan tidak menimpanya dengan seed versi baru.
@@ -68,6 +86,7 @@ run.bat
 - `output/Katalog_Promo_Final.csv` — data katalog beserta provenance.
 - `output/Katalog_Promo_Final_Ringkas.csv` — katalog ringkas.
 - `output/Daftar_Cari_Harga_Manual.xlsx` — lembar untuk mengisi referensi harga pasar dari halaman sumber langsung.
+- `output/Riwayat_Promo.csv` — seluruh promo yang pernah diamati, termasuk promo expired dan versi penawaran yang sudah digantikan.
 - `runtime/promo_multisource_catalog_images.csv` — URL poster/gambar yang ditemukan di halaman; bukan teks hasil pembacaan gambar.
 - `runtime/promo_multisource_runlog.json` — rincian request dan status collector tiap sumber.
 - `runtime/source_health_summary.json` — ringkasan status sumber, jumlah produk segar/data lama yang dipakai, kelengkapan bukti harga/periode, dan peringatan sumber.
@@ -90,7 +109,7 @@ Jika `python` di PATH bukan interpreter yang dipilih launcher, jalankan kedua pe
 
 ## Kualitas dan batasan
 
-- Status health-check **partial** berarti setidaknya ada sumber yang datanya berasal dari cache terakhir, tidak menghasilkan produk baru, atau mengalami error. Lihat `runtime/source_health_summary.json` sebelum memakai katalog untuk keputusan penting.
+- Status health-check **partial** berarti ada sumber yang menggunakan data lama/carry-forward, tidak menghasilkan produk baru, atau mengalami error. Baris lama tetap ditandai agar tidak disangka hasil scrape terbaru. Lihat `runtime/source_health_summary.json` sebelum memakai katalog untuk keputusan penting.
 - Source health menghitung konektivitas, data yang terkumpul, dan cakupan bukti; laporan tersebut bukan jaminan bahwa semua produk/ harga telah benar.
 - Jika semua sumber tidak menghasilkan produk segar maupun data sebelumnya, pipeline berhenti agar katalog kosong tidak menimpa hasil yang valid sebelumnya.
 - Sumber publik dapat mengubah struktur HTML atau membatasi akses. Tes offline tidak menjamin scraping live akan berhasil setiap saat.

@@ -75,6 +75,7 @@ if not exist "%~dp0src\promo_multisource_collector.py" goto :bad_project
 if not exist "%~dp0src\enrich_existing_promo_catalog_multisource.py" goto :bad_project
 if not exist "%~dp0src\source_health_check.py" goto :bad_project
 if not exist "%~dp0src\verify_outputs.py" goto :bad_project
+if not exist "%~dp0src\promo_history.py" goto :bad_project
 
 set "CHECK_ARGS=--dev"
 if /I "%MODE%"=="check" set "CHECK_ARGS="
@@ -157,6 +158,7 @@ echo Excel : output\Katalog_Promo_Final.xlsx
 echo CSV   : output\Katalog_Promo_Final.csv
 echo Gambar: runtime\promo_multisource_catalog_images.csv (URL saja)
 echo Health: runtime\source_health_summary.json
+echo Riwayat: output\Riwayat_Promo.csv (seluruh promo, termasuk expired)
 echo Harga acuan otomatis tersimpan di state\ (bukan data\)
 echo Tidak ada venv/pip install/OCR gambar dalam pipeline ini.
 echo =====================================================
