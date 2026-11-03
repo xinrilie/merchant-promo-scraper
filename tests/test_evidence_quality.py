@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 ENGINE_DIR = Path(__file__).resolve().parents[1] / "src"
@@ -96,7 +96,10 @@ def test_uniqlo_editorial_fragment_with_rp199000_is_rejected_by_final_import():
     assert rows[0]["product_rejection_reason"] == "editorial_heading_misparsed_as_product"
 
 
-def test_unsubstantiated_price_is_cleared_and_sent_to_review():
+def test_unsubstantiated_price_is_cleared_and_sent_to_review(monkeypatch):
+    # Freeze the business date so the fixture remains valid after October 2026.
+    # Production status must still use the actual Asia/Jakarta date.
+    monkeypatch.setattr(enhancer, "TODAY", date(2026, 10, 15))
     with __import__("tempfile").TemporaryDirectory() as temp_dir:
         path = Path(temp_dir) / "feed.csv"
         _write_feed(path, {
@@ -128,6 +131,14 @@ def test_unsubstantiated_price_is_cleared_and_sent_to_review():
     assert row["period_precision"] == "unverified"
     assert row["promo_status"] == "active_estimated"
     assert row["period_certainty"] == "estimated"
+
+
+def test_unverified_promo_period_that_has_ended_is_expired(monkeypatch):
+    # Even an unverified date range must not remain active after its end date.
+    monkeypatch.setattr(enhancer, "TODAY", date(2026, 11, 3))
+    assert enhancer.current_status(
+        "2026-10-01", "2026-10-31", "unverified"
+    ) == "expired"
 
 
 def test_name_cleaned_to_empty_is_reviewed_and_never_published_as_product_price():
