@@ -1,3 +1,3 @@
-# Complete development set. The launcher only validates; it never runs pip install.
+# Development/test dependencies; not required for --check-only or price-research mode.
 -r requirements.txt
-pytest>=8.0,<10
+pytest>=9.2.0,<10
