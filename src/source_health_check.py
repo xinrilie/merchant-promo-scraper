@@ -13,8 +13,8 @@ DEFAULT_INPUT = ROOT / "runtime" / "promo_multisource_runlog.json"
 DEFAULT_OUTPUT = ROOT / "runtime" / "source_health_summary.json"
 JAKARTA = ZoneInfo("Asia/Jakarta")
 KNOWN_SOURCES = ("Hemat.id", "Katalogpromosi.com", "Scanharga.com")
-USABLE_STATUSES = {"fresh", "preserved_previous", "reachable_no_products"}
-WARNING_STATUSES = {"request_failed", "blocked_or_limited", "no_request", "unknown"}
+USABLE_STATUSES = {"fresh", "fresh_with_preserved", "preserved_previous", "reachable_no_products"}
+WARNING_STATUSES = {"fresh_with_preserved", "request_failed", "blocked_or_limited", "no_request", "unknown"}
 
 
 def _parse_datetime(value: object) -> datetime | None:
@@ -63,7 +63,15 @@ def build_summary(log: dict, *, now: datetime | None = None) -> dict:
         failed_requests = _as_int(raw.get("failed_requests"))
         blocked_requests = _as_int(raw.get("blocked_or_limited_requests"))
 
-        if status == "fresh":
+        if status == "fresh_with_preserved":
+            health = "healthy_with_warnings"
+            partial_sources += 1
+            warnings.append(
+                f"{name}: ada data baru dan {preserved_rows} baris lama yang dipertahankan; "
+                "periksa kolom kesegaran sebelum menganggap seluruh data terbaru."
+            )
+            fresh_sources += 1
+        elif status == "fresh":
             if failed_requests or blocked_requests:
                 health = "healthy_with_warnings"
                 partial_sources += 1
@@ -140,6 +148,7 @@ def build_summary(log: dict, *, now: datetime | None = None) -> dict:
         "partial_or_warning_sources": partial_sources,
         "product_rows_in_source_outputs": usable_rows_total,
         "image_references_found": int(log.get("image_references_found") or 0),
+        "promo_history": log.get("promo_history") if isinstance(log.get("promo_history"), dict) else {},
         "ocr_used": False,
         "images_downloaded_for_text_extraction": False,
         "sources": sources,

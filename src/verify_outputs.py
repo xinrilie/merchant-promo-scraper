@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 REQUIRED_FILES = {
     "workbook": Path("output/Katalog_Promo_Final.xlsx"),
     "catalog_csv": Path("output/Katalog_Promo_Final.csv"),
+    "promo_history": Path("output/Riwayat_Promo.csv"),
     "image_index": Path("runtime/promo_multisource_catalog_images.csv"),
     "source_health": Path("runtime/source_health_summary.json"),
 }
@@ -69,7 +70,7 @@ def verify_outputs(root: Path = ROOT) -> dict[str, Any]:
             errors.append(f"Workbook tidak dapat dibuka: {workbook_path} ({exc})")
             report["files"]["workbook"]["ok"] = False
 
-    for key in ("catalog_csv", "image_index"):
+    for key in ("catalog_csv", "promo_history", "image_index"):
         if report["files"][key]["ok"]:
             problem = _check_csv(resolved[key])
             if problem:
