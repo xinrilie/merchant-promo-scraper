@@ -370,7 +370,9 @@ def test_excel_exports_reference_database_and_clearly_labels_reference_discount(
         assert "Dasar Diskon" in headers
         assert "URL Referensi Harga" in headers
         assert headers[:7] == ["Nama Produk", "Kategori Produk", "Merchant", "Harga Asli (Rp)", "Harga Promo (Rp)", "Diskon (%)", "Basis Harga Asli"]
-        assert headers[7:11] == ["Harga Asli dari Sumber (Rp)", "Harga Normal Referensi (Rp)", "Rentang Referensi Harga (Rp)", "Dasar Diskon"]
+        assert headers[7:10] == ["Harga Asli dari Sumber (Rp)", "Harga Normal Referensi (Rp)", "Rentang Referensi Harga (Rp)"]
+        assert "Harga Normal Estimasi Pasar (Rp)" in headers
+        assert headers.index("Harga Normal Estimasi Pasar (Rp)") < headers.index("Dasar Diskon")
         assert headers.index("Merchant Acuan Referensi") < headers.index("Sumber Referensi Harga")
         values = list(active.iter_rows(min_row=2, max_row=2, values_only=True))[0]
         row_values = dict(zip(headers, values))
