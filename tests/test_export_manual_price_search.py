@@ -59,3 +59,34 @@ def test_image_reference_cannot_supply_a_normal_price(tmp_path, monkeypatch):
     assert products[0]["Nama Produk"] == "Sunlight Lime 910 ml"
     assert products[0]["Harga Referensi (Rp) - isi manual"] == ""
     assert stats["excluded_with_normal_price"] == 0
+
+
+
+def test_generated_manual_workbook_contains_tokku_verification_fields(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+    source = tmp_path / "products.csv"
+    catalog = tmp_path / "catalog.csv"
+    output = tmp_path / "Daftar_Cari_Harga_Manual.xlsx"
+    _write_csv(source, [{
+        "product_text": "Sania Minyak Goreng Pouch 2 L", "promo_price": "20000",
+        "normal_price": "", "merchant_name": "Shop A", "product_validation_status": "eligible",
+        "source_url": "https://example.test/promo",
+    }])
+    _write_csv(catalog, [{"Nama Produk": "Sania Minyak Goreng Pouch 2 L"}])
+    monkeypatch.setattr(exporter, "SOURCE", source)
+    monkeypatch.setattr(exporter, "CATALOG_CANDIDATES", (catalog,))
+    monkeypatch.setattr(exporter, "OUT", output)
+    exporter.main()
+    wb = load_workbook(output, read_only=True, data_only=True)
+    try:
+        ws = wb["Cari Harga"]
+        headers = [cell.value for cell in next(ws.iter_rows(min_row=1, max_row=1))]
+        assert "Retailer Pembanding" in headers
+        assert "Tanggal Terakhir Dicek oleh Sumber (YYYY-MM-DD)" in headers
+        assert "Kecocokan SKU (exact/close/unknown)" in headers
+        assert ws.max_row == 2
+        assert "Tokku" not in str(ws.cell(2, 7).value or "")  # no source is prefilled as a claim.
+        help_text = " ".join(str(row[0]) for row in wb["Petunjuk"].iter_rows(values_only=True))
+        assert "Tidak ada collector otomatis Tokku" in help_text
+    finally:
+        wb.close()
