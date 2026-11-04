@@ -62,10 +62,23 @@ OUT_LOG = RUNTIME_DIR / "promo_multisource_runlog.json"
 OUT_REJECTED_CANDIDATES = RUNTIME_DIR / "promo_multisource_rejected_candidates.csv"
 REJECTED_PRODUCT_CANDIDATES: list[dict] = []
 
+# Hemat pages with a single retailer slug are preferred. Combined comparison
+# pages (for example /katalog-alfamart,yogya/) mix merchant contexts and make
+# source attribution less reliable, so they are intentionally excluded.
+HEMAT_SUPPORTED_RETAILER_SLUGS = (
+    "alfamart",
+    "indomaret",
+    "alfamidi",
+    "superindo",
+    "hypermart",
+    "yogya",
+    "tip-top",
+)
+
 SOURCE_SEEDS = {
     "Hemat.id": [
-        "https://www.hemat.id/katalog-alfamart/",
-        "https://www.hemat.id/katalog-alfamart,indomaret/promo-promo/",
+        f"https://www.hemat.id/katalog-{slug}/"
+        for slug in HEMAT_SUPPORTED_RETAILER_SLUGS
     ],
     "Katalogpromosi.com": [
         "https://katalogpromosi.com/",
@@ -1077,7 +1090,14 @@ def is_listing_link(source_name: str, url: str, text: str) -> bool:
     path = urlparse(url).path.lower()
     txt = clean_text(text).casefold()
     if source_name == "Hemat.id":
-        return any(mark in path for mark in ("/katalog-", "/promo-promo/")) or bool(re.search(r"/page/\d+/?$", path)) or "promo halaman" in txt
+        # Only follow supported single-retailer catalogue routes. Do not follow
+        # combined comparison slugs (comma-separated) or generic retailer names
+        # that are not part of the configured source coverage.
+        match = re.fullmatch(
+            r"/katalog-([a-z0-9-]+)(?:/promo-promo)?/?",
+            path,
+        )
+        return bool(match and match.group(1) in HEMAT_SUPPORTED_RETAILER_SLUGS)
     if source_name == "Katalogpromosi.com":
         return (
             bool(re.search(r"/page/\d+/?$", path))

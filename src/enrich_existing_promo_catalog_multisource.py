@@ -9,6 +9,7 @@ from collections import Counter, OrderedDict, defaultdict
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
+from urllib.parse import urlparse
 import math
 
 from promo_names import (
@@ -2677,6 +2678,9 @@ def clean_sort_key(row):
 
 def make_clean_row(row, review=False):
     item = dict(row)
+    # Keep raw provenance in audit/snapshot fields; only the user-facing clean
+    # catalog gets the most specific applicable source link.
+    item["source_url"] = preferred_source_url(row)
     item["display_status"] = display_status(row)
     item["product_quality_label"] = product_validation_display(row)
     item["display_deal_type"] = row.get("deal_type") or row.get("campaign_type") or ""
@@ -2777,6 +2781,67 @@ POSSIBLE_DUPLICATE_FIELDS = [
     "Periode A", "Periode B", "Penawaran A", "Penawaran B", "Sumber A", "Sumber B",
     "Alasan", "Tindakan",
 ]
+
+
+def preferred_source_url(row):
+    """Choose the most useful user-facing source link without losing provenance.
+
+    The raw source_url/source_page_url/source_item_url fields remain unchanged in
+    the audit data. This helper only selects the link displayed in clean catalogs.
+    For Hemat cards, a valid SKU/category page is more useful than a broad
+    multi-retailer comparison page. If an old row has only a comparison URL, use
+    a single-retailer catalogue when the merchant is unambiguous.
+    """
+    source_name = str(row.get("source_name") or row.get("source_names") or "").casefold()
+    source_url = str(row.get("source_url") or row.get("source_page_url") or "").strip()
+    item_url = str(row.get("source_item_url") or "").strip()
+
+    if "hemat" not in source_name:
+        return source_url or item_url
+
+    def valid_hemat_detail_url(value: str) -> bool:
+        if not value:
+            return False
+        try:
+            parsed = urlparse(value)
+        except ValueError:
+            return False
+        host = (parsed.hostname or "").casefold()
+        path = parsed.path or ""
+        if parsed.scheme not in {"http", "https"} or host not in {"hemat.id", "www.hemat.id"}:
+            return False
+        # Hemat product detail pages use both /harga/<slug>/ and the legacy
+        # /harga-<slug>/ form; category/item detail pages use /katalog/<slug>/.
+        # Reject malformed placeholders like /katalog// and broad catalogue
+        # routes like /katalog-alfamart/.
+        return bool(
+            re.match(r"^/(?:harga|katalog)/[^/]+(?:/|$)", path)
+            or re.match(r"^/harga-[^/]+(?:/|$)", path)
+        )
+
+    if valid_hemat_detail_url(item_url):
+        return item_url
+
+    merchant = str(row.get("merchant_name") or "").casefold()
+    normalized = re.sub(r"[^a-z0-9]+", "", merchant)
+    merchant_slugs = {
+        "alfamart": "alfamart",
+        "alfamidi": "alfamidi",
+        "indomaret": "indomaret",
+        "superindo": "superindo",
+        "hypermart": "hypermart",
+        "yogya": "yogya",
+        "yogyatoserba": "yogya",
+        "toserbayogya": "yogya",
+        "tiptop": "tip-top",
+    }
+    slug = merchant_slugs.get(normalized)
+    if slug:
+        return f"https://www.hemat.id/katalog-{slug}/"
+
+    # Unknown/ambiguous merchant: preserve the exact original source URL rather
+    # than inventing a retailer-specific destination.
+    return source_url or item_url
 
 
 def _source_url_primary(row):
@@ -3384,7 +3449,7 @@ def make_simple_excel_row(row):
         "Penawaran": offer or "—",
         "Status Promo": display_status(row),
         "Verifikasi Sumber": row.get("source_verification_label") or source_verification_label(row.get("verification_status")),
-        "Sumber URL": row.get("source_url") or "",
+        "Sumber URL": clean.get("Sumber URL") or "",
         "_discount_numeric": isinstance(discount_cell, (int, float)),
         "_discount_basis": calculation_basis or existing_basis,
         "_review_required": (
