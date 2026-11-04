@@ -21,6 +21,13 @@ Pipeline Python untuk mengambil data promo dari halaman publik Hemat.id, Katalog
 
 `output/`, `runtime/`, dan `state/` diabaikan oleh Git. Hanya data referensi awal dan referensi yang dikurasi manual yang berada di `data/`.
 
+
+### Routing URL Hemat.id
+
+Collector Hemat.id memulai pengambilan dari tujuh halaman retailer tunggal: Alfamart, Indomaret, Alfamidi, Super Indo, Hypermart, Yogya, dan Tip Top. Discovery hanya menerima slug retailer yang didukung tersebut (termasuk jalur `/promo-promo/` di bawah katalog retailer). URL perbandingan beberapa retailer seperti `/katalog-alfamart,yogya/` dan slug retailer yang belum didukung tidak diikuti agar atribusi merchant tidak tercampur.
+
+Untuk URL yang ditampilkan di katalog, sistem mengutamakan `source_item_url` Hemat yang valid di `/harga/<slug>/`, `/harga-<slug>/`, atau `/katalog/<slug>/`. Jika record lama hanya memiliki URL perbandingan, katalog menggunakan halaman katalog tunggal berdasarkan merchant yang teridentifikasi. Jika merchant tidak dikenal, URL asli dipertahankan. Field provenance mentah tetap ada di snapshot dan audit; pemilihan ini hanya memengaruhi URL yang ditampilkan di katalog bersih.
+
 ## Python tanpa virtual environment dan tanpa instalasi otomatis
 
 `run.bat` mencoba `PROMO_PYTHON`, lokasi instalasi Python umum, `py -3`, lalu `python`. **Kandidat diuji berdasarkan versi dan library yang benar-benar bisa diimpor**, bukan hanya nomor versi. Python minimal 3.11 (Python 3.10 sudah EOL sejak 1 Oktober 2026) harus memiliki `requests`, `beautifulsoup4` (`bs4`), dan `openpyxl`. Mode normal dan tes offline juga membutuhkan `pytest`; `--check-only` tidak membutuhkan `pytest`.
