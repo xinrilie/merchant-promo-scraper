@@ -13,7 +13,10 @@ from urllib.parse import urlparse
 
 from openpyxl import load_workbook
 
-from promo_market_prices import MARKET_REFERENCE_CSV, MARKET_REFERENCE_FIELDS, parse_idr_price, upsert_market_reference_database
+from promo_market_prices import (
+    MARKET_REFERENCE_CSV, MARKET_REFERENCE_FIELDS, parse_idr_price,
+    initialize_market_reference_database, upsert_market_reference_database,
+)
 from promo_names import product_name_size_signature, product_name_variant_signature
 from promo_price_reference import identity_key
 
@@ -40,9 +43,17 @@ def _normalize_input_row(row: dict, idx: int):
     observed = str(row.get("Tanggal Cek (YYYY-MM-DD)") or "").strip()[:10]
     kind = str(row.get("Jenis Referensi (pasar/normal)") or "pasar").strip().lower()
     title = str(row.get("Judul Halaman") or "").strip()
+    retailer = str(row.get("Retailer Pembanding") or "").strip()
+    classification = str(row.get(
+        "Klasifikasi Harga (normal_before_promo/regular_no_promo/promo/historical_average_3m/historical_min/unclear)"
+    ) or "").strip().casefold()
+    source_checked = str(row.get("Tanggal Terakhir Dicek oleh Sumber (YYYY-MM-DD)") or "").strip()[:10]
+    product_match = str(row.get("Kecocokan SKU (exact/close/unknown)") or "unknown").strip().casefold()
+    manual_note = str(row.get("Catatan Verifikasi") or "").strip()
 
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower().removeprefix("www.")
+    is_tokku = host == "tokku.app" or source.casefold() == "tokku"
     issues = []
     if not name or not identity_key(name):
         issues.append("nama produk kosong/tidak valid")
@@ -61,13 +72,62 @@ def _normalize_input_row(row: dict, idx: int):
     try:
         date.fromisoformat(observed)
     except ValueError:
-        issues.append("tanggal harus YYYY-MM-DD")
+        issues.append("tanggal cek manual harus YYYY-MM-DD")
+    if source_checked:
+        try:
+            checked_date = date.fromisoformat(source_checked)
+            if observed and checked_date > date.fromisoformat(observed):
+                issues.append("tanggal terakhir dicek oleh sumber tidak boleh setelah tanggal cek manual")
+        except ValueError:
+            issues.append("tanggal terakhir dicek oleh sumber harus YYYY-MM-DD")
+
+    if is_tokku:
+        if host != "tokku.app":
+            issues.append("sumber Tokku harus memakai URL halaman produk tokku.app")
+        elif "/id/product/" not in parsed.path:
+            issues.append("gunakan URL halaman detail produk Tokku, bukan halaman kategori/beranda")
+        if not retailer:
+            issues.append("nama retailer yang ditampilkan Tokku wajib diisi")
+        if not source_checked:
+            issues.append("tanggal 'Dicek' yang ditampilkan Tokku wajib diisi; jangan gunakan tanggal buka halaman sebagai pengganti")
+        if product_match != "exact":
+            issues.append("Tokku hanya diterima jika merek, varian, dan ukuran cocok exact")
+        if classification not in {
+            "normal_before_promo", "regular_no_promo", "promo",
+            "historical_average_3m", "historical_min", "unclear",
+        }:
+            issues.append("klasifikasi harga Tokku wajib dipilih dari dropdown")
 
     if issues:
         return None, f"Baris {idx}: " + "; ".join(issues)
 
     product_key = identity_key(name)
     normalized_kind = "normal" if kind in {"normal", "regular", "harga normal"} else "market"
+    source_kind = "manual_user_checked"
+    confidence = "manual_checked"
+    if is_tokku:
+        classification_to_kind = {
+            "normal_before_promo": "regular",
+            "regular_no_promo": "regular",
+            "promo": "promo",
+            "historical_average_3m": "historical_average",
+            "historical_min": "historical_min",
+            "unclear": "unknown",
+        }
+        normalized_kind = classification_to_kind[classification]
+        source_kind = "manual_tokku_checked"
+        confidence = "manual_checked_exact_sku"
+    elif classification:
+        classification_to_kind = {
+            "normal_before_promo": "normal",
+            "regular_no_promo": "regular",
+            "promo": "promo",
+            "historical_average_3m": "historical_average",
+            "historical_min": "historical_min",
+            "unclear": "unknown",
+        }
+        normalized_kind = classification_to_kind.get(classification, normalized_kind)
+
     return ({
         "product_text": name,
         "product_key": product_key,
@@ -78,13 +138,17 @@ def _normalize_input_row(row: dict, idx: int):
         "source_name": source,
         "source_domain": host,
         "source_url": url,
-        "evidence_text": evidence,
+        "evidence_text": evidence + (f" | Catatan verifikasi: {manual_note}" if manual_note else ""),
         "page_title": title,
         "price_kind": normalized_kind,
-        "source_kind": "manual_user_checked",
+        "source_kind": source_kind,
         "verification_method": "page_price_verified",
-        "confidence": "manual_checked",
+        "confidence": confidence,
         "reference_key": "",
+        "retailer_name": retailer,
+        "source_checked_at": source_checked or observed,
+        "price_classification": classification,
+        "product_match_status": product_match,
     }, None)
 
 
@@ -133,6 +197,7 @@ def main(argv=None):
         raise SystemExit("Format input belum didukung. Gunakan workbook .xlsx dari pencarian harga manual.")
 
     entries, errors, total = _read_xlsx(path)
+    initialization = initialize_market_reference_database(DB)
     stats = upsert_market_reference_database(DB, entries)
     print(f"Input: {path}")
     print(f"Baris referensi dibaca: {total}")

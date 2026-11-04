@@ -33,7 +33,10 @@ HEADERS = [
     "ID Produk", "Nama Produk", "Merchant Promo", "Harga Promo (Rp)",
     "Kata Kunci Pencarian (copy)", "Harga Referensi (Rp) - isi manual",
     "Nama Sumber", "URL Halaman Harga", "Bukti Harga pada Halaman",
-    "Tanggal Cek (YYYY-MM-DD)", "Jenis Referensi (pasar/normal)", "Status"
+    "Tanggal Cek (YYYY-MM-DD)", "Jenis Referensi (pasar/normal)",
+    "Retailer Pembanding", "Klasifikasi Harga (normal_before_promo/regular_no_promo/promo/historical_average_3m/historical_min/unclear)",
+    "Tanggal Terakhir Dicek oleh Sumber (YYYY-MM-DD)",
+    "Kecocokan SKU (exact/close/unknown)", "Catatan Verifikasi", "Status"
 ]
 
 
@@ -110,6 +113,11 @@ def read_products():
             "Bukti Harga pada Halaman": "",
             "Tanggal Cek (YYYY-MM-DD)": "",
             "Jenis Referensi (pasar/normal)": "pasar",
+            "Retailer Pembanding": "",
+            "Klasifikasi Harga (normal_before_promo/regular_no_promo/promo/historical_average_3m/historical_min/unclear)": "",
+            "Tanggal Terakhir Dicek oleh Sumber (YYYY-MM-DD)": "",
+            "Kecocokan SKU (exact/close/unknown)": "unknown",
+            "Catatan Verifikasi": "",
             "Status": "BELUM DICARI",
         })
     return out, stats
@@ -165,7 +173,7 @@ def main():
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="244062")
         cell.alignment = Alignment(wrap_text=True, vertical="center")
-    widths = [12, 38, 23, 18, 48, 24, 24, 48, 42, 20, 25, 18]
+    widths = [12, 38, 23, 18, 48, 24, 24, 48, 54, 20, 25, 24, 55, 31, 24, 42, 18]
     for idx, width in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(idx)].width = width
     for row in ws.iter_rows(min_row=2):
@@ -176,17 +184,30 @@ def main():
     help_text = [
         "CARA PAKAI DAFTAR CARI HARGA PASAR",
         "1. Daftar ini hanya untuk produk yang belum memiliki harga normal eksplisit dari teks sumber promo.",
-        "2. Salin Kata Kunci Pencarian ke mesin pencari, lalu cari SKU, varian, ukuran dan isi yang sama persis.",
-        "3. Isi harga, nama toko, URL halaman produk langsung, bukti teks harga yang terlihat, dan tanggal cek.",
-        "4. Gandakan baris bila ingin mengumpulkan harga dari beberapa toko/domain independen.",
-        "5. Jenis normal hanya jika halaman secara eksplisit menyebut harga normal; jika tidak, pilih pasar.",
-        "6. Simpan dan tutup Excel, kemudian jalankan: python src\\import_manual_price_references.py output\\Daftar_Cari_Harga_Manual.xlsx",
-        "7. Referensi pasar tidak mengubah harga normal resmi dan tidak dianggap terverifikasi hanya karena nama toko diisi.",
-        "8. Estimasi AI tanpa sumber dan pembacaan otomatis poster/gambar tidak digunakan. URL gambar hanya disimpan sebagai referensi visual.",
+        "2. Prioritaskan halaman detail Hemat.id /harga/ untuk SKU, varian, ukuran dan isi yang sama persis.",
+        "3. Harga normal sebelum promo hanya boleh dicatat jika sumber menampilkan harga tersebut secara eksplisit.",
+        "4. Rata-rata historis 3 bulan Hemat.id dapat dicatat sebagai historical_average_3m, tetapi keyakinannya rendah karena periode historis dapat mencakup harga promo.",
+        "5. Jika Hemat.id tidak menyediakan bukti yang cukup, Tokku hanya boleh diperiksa manual untuk sejumlah kecil produk yang belum memiliki harga. Tidak ada collector otomatis Tokku.",
+        "6. Untuk Tokku, gunakan halaman produk /id/product/ yang cocok persis; catat satu retailer per baris, tanggal terakhir dicek oleh Tokku, klasifikasi harga dan URL halaman.",
+        "7. Harga Tokku yang terakhir dicek lebih dari 30 hari lalu tetap boleh dicatat untuk arsip, tetapi tidak dipakai sebagai estimasi harga normal terkini.",
+        "8. Harga promo, harga terendah historis dan harga yang klasifikasinya tidak jelas tidak boleh diperlakukan sebagai harga normal.",
+        "9. Harga referensi/estimasi disimpan terpisah dan tidak menimpa Harga Asli dari sumber promo atau menghitung diskon resmi.",
+        "10. Gandakan baris untuk retailer/domain independen. Cocokkan merek, SKU, varian, ukuran, isi, serta kondisi kemasan sebelum mengisi.",
+        r"11. Simpan dan tutup Excel, kemudian jalankan: python src\import_manual_price_references.py output\Daftar_Cari_Harga_Manual.xlsx",
+        "12. Tidak ada pembacaan OCR poster/gambar. URL gambar hanya disimpan sebagai referensi visual.",
     ]
     for line in help_text:
         helpws.append([line])
-    helpws.column_dimensions["A"].width = 140
+    helpws.column_dimensions["A"].width = 150
+    from openpyxl.worksheet.datavalidation import DataValidation
+    classification_col = HEADERS.index("Klasifikasi Harga (normal_before_promo/regular_no_promo/promo/historical_average_3m/historical_min/unclear)") + 1
+    match_col = HEADERS.index("Kecocokan SKU (exact/close/unknown)") + 1
+    dv_class = DataValidation(type="list", formula1='"normal_before_promo,regular_no_promo,promo,historical_average_3m,historical_min,unclear"', allow_blank=True)
+    dv_match = DataValidation(type="list", formula1='"exact,close,unknown"', allow_blank=True)
+    ws.add_data_validation(dv_class)
+    ws.add_data_validation(dv_match)
+    dv_class.add(f"{get_column_letter(classification_col)}2:{get_column_letter(classification_col)}2000")
+    dv_match.add(f"{get_column_letter(match_col)}2:{get_column_letter(match_col)}2000")
     for row in helpws.iter_rows():
         for cell in row:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
