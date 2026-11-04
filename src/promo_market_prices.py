@@ -17,13 +17,18 @@ from promo_names import clean_product_name, product_name_size_signature, product
 from promo_price_reference import identity_key
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-MARKET_REFERENCE_CSV = ROOT_DIR / "data" / "product_market_price_reference.csv"
+# Manually checked and dynamic market-price observations belong in ignored local state.
+# The tracked data/ CSV remains a seed that can be migrated on first use.
+MARKET_REFERENCE_CSV = ROOT_DIR / "state" / "product_market_price_reference.csv"
+MARKET_REFERENCE_SEED_CSV = ROOT_DIR / "data" / "product_market_price_reference.csv"
 DEFAULT_MAX_AGE_DAYS = 14
+DEFAULT_NORMAL_ESTIMATE_MAX_AGE_DAYS = 30
 MARKET_REFERENCE_FIELDS = [
     "product_text", "product_key", "size_signature", "variant_signature",
     "market_price", "observed_at", "source_name", "source_domain", "source_url",
     "evidence_text", "page_title", "price_kind", "source_kind", "verification_method",
-    "confidence", "reference_key",
+    "confidence", "reference_key", "retailer_name", "source_checked_at",
+    "price_classification", "product_match_status",
 ]
 
 
@@ -88,6 +93,28 @@ def _ensure_csv(path: Path, fields: list[str]) -> None:
             csv.DictWriter(handle, fieldnames=fields).writeheader()
 
 
+def initialize_market_reference_database(
+    path: str | Path = MARKET_REFERENCE_CSV,
+    seed_path: str | Path = MARKET_REFERENCE_SEED_CSV,
+) -> str:
+    """Create local market-reference state, migrating the tracked seed once."""
+    path = Path(path)
+    seed = Path(seed_path)
+    if path.exists():
+        return "existing"
+    if seed.exists():
+        try:
+            with seed.open("r", encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            if rows:
+                upsert_market_reference_database(path, rows)
+                return "migrated_seed"
+        except (OSError, csv.Error):
+            pass
+    _ensure_csv(path, MARKET_REFERENCE_FIELDS)
+    return "created_empty"
+
+
 def load_market_reference_database(path: str | Path = MARKET_REFERENCE_CSV) -> list[dict]:
     """Load only market prices with a URL, evidence, timestamp and verified-page marker."""
     path = Path(path)
@@ -103,6 +130,7 @@ def load_market_reference_database(path: str | Path = MARKET_REFERENCE_CSV) -> l
         price = parse_idr_price(row.get("market_price"))
         observed = _parse_date(row.get("observed_at"))
         parsed = urlparse(row.get("source_url", ""))
+        is_tokku = (parsed.hostname or "").lower().removeprefix("www.") == "tokku.app"
         if (
             not row.get("product_key") or not row.get("product_text")
             or price is None or price < 100 or price > 100_000_000
@@ -110,6 +138,11 @@ def load_market_reference_database(path: str | Path = MARKET_REFERENCE_CSV) -> l
             or parsed.scheme not in {"http", "https"} or not parsed.hostname
             or not row.get("source_domain")
             or row.get("verification_method") != "page_price_verified"
+            or (is_tokku and (
+                not row.get("retailer_name")
+                or row.get("product_match_status", "").casefold() != "exact"
+                or not _parse_date(row.get("source_checked_at"))
+            ))
         ):
             continue
         row["market_price"] = str(price)
@@ -125,7 +158,10 @@ def upsert_market_reference_database(path: str | Path, rows: list[dict]) -> dict
     # A collection/category page can list many different SKUs, so URL alone is
     # not a unique key. Keep a separate reference for each product on that page.
     by_url = {
-        (row.get("product_key", ""), row.get("source_url", ""), row.get("price_kind", "market")): row
+        (
+            row.get("product_key", ""), row.get("source_url", ""),
+            row.get("price_kind", "market"), row.get("retailer_name", "").casefold(),
+        ): row
         for row in existing if row.get("source_url")
     }
     added = updated = 0
@@ -141,11 +177,17 @@ def upsert_market_reference_database(path: str | Path, rows: list[dict]) -> dict
             continue
         row["market_price"] = str(price)
         row["source_domain"] = parsed.hostname.lower().removeprefix("www.")
-        key = (row.get("product_key", ""), row["source_url"], row.get("price_kind", "market"))
+        key = (
+            row.get("product_key", ""), row["source_url"],
+            row.get("price_kind", "market"), row.get("retailer_name", "").casefold(),
+        )
         old = by_url.get(key)
         if old is None:
             added += 1
-        elif any(old.get(k) != row.get(k) for k in ("market_price", "observed_at", "evidence_text", "product_key")):
+        elif any(old.get(k) != row.get(k) for k in (
+            "market_price", "observed_at", "source_checked_at", "evidence_text",
+            "product_key", "retailer_name", "price_classification",
+        )):
             updated += 1
         by_url[key] = row
     ordered = sorted(by_url.values(), key=lambda r: (r.get("product_key", ""), r.get("source_domain", ""), r.get("observed_at", "")))
@@ -159,14 +201,157 @@ def upsert_market_reference_database(path: str | Path, rows: list[dict]) -> dict
     return {"records_before": len(existing), "records_added": added, "records_updated": updated, "records_after": len(ordered), "database_path": str(path)}
 
 
+def estimate_normal_prices_from_references(
+    rows: list[dict],
+    references: list[dict],
+    today: date | None = None,
+    max_age_days: int = DEFAULT_NORMAL_ESTIMATE_MAX_AGE_DAYS,
+) -> dict:
+    """Attach a clearly labelled normal-market estimate from exact manual evidence.
+
+    Only exact product/size/variant matches classified as an explicit normal price,
+    a regular non-promo price, or a 3-month historical average are considered.
+    Promo prices, unknown classifications, and stale source-side observations are
+    deliberately excluded. Results never overwrite the source's original price.
+    """
+    today = today or date.today()
+    by_product: dict[str, list[dict]] = {}
+    accepted_kinds = {"normal", "regular", "historical_average"}
+    for raw in references:
+        item = _normalize_record(raw)
+        kind = str(item.get("price_kind") or "market").casefold()
+        if kind not in accepted_kinds:
+            continue
+        checked = _parse_date(item.get("source_checked_at")) or _parse_date(item.get("observed_at"))
+        manual_seen = _parse_date(item.get("observed_at"))
+        price = parse_idr_price(item.get("market_price"))
+        if (
+            not checked or checked > today or (today - checked).days > max_age_days
+            or not manual_seen or manual_seen > today or price is None
+        ):
+            continue
+        if str(item.get("source_domain") or "").casefold().removeprefix("www.") == "tokku.app":
+            if str(item.get("product_match_status") or "").casefold() != "exact":
+                continue
+            if not str(item.get("retailer_name") or "").strip():
+                continue
+        item["_estimate_checked_date"] = checked
+        item["_estimate_age_days"] = (today - checked).days
+        by_product.setdefault(item.get("product_key", ""), []).append(item)
+
+    summary = {
+        "rows_checked": 0, "rows_estimated": 0, "tokku_estimates": 0,
+        "historical_average_estimates": 0, "stale_or_unmatched": 0,
+        "max_age_days": max_age_days,
+    }
+    for row in rows:
+        for field in (
+            "estimated_normal_price", "estimated_normal_low", "estimated_normal_high",
+            "estimated_normal_basis", "estimated_normal_sources", "estimated_normal_retailers",
+            "estimated_normal_source_urls", "estimated_normal_observed_at", "estimated_normal_age_days",
+            "estimated_normal_observation_count", "estimated_normal_confidence",
+            "estimated_normal_status", "estimated_normal_note",
+        ):
+            row.setdefault(field, None)
+
+        # Keep exact/source-derived prices authoritative. This field is a separate
+        # estimate and is only used where the promotion has no usable normal price.
+        if parse_idr_price(row.get("normal_price")) is not None or parse_idr_price(row.get("reference_normal_price")) is not None:
+            continue
+        if row.get("product_validation_status") != "eligible":
+            continue
+        product = clean_product_name(row.get("product_text"))
+        pkey = identity_key(product)
+        if not pkey:
+            continue
+        summary["rows_checked"] += 1
+        qsize = "|".join(product_name_size_signature(product))
+        qvariant = "|".join(sorted(product_name_variant_signature(product)))
+        candidates = [
+            item for item in by_product.get(pkey, [])
+            if item.get("size_signature", "") == qsize
+            and item.get("variant_signature", "") == qvariant
+        ]
+        if not candidates:
+            if any(item.get("product_key") == pkey for item in references):
+                summary["stale_or_unmatched"] += 1
+            continue
+
+        # Explicit regular/current observations take precedence over the 3-month
+        # historical average. A historical average is a lower-confidence fallback.
+        regular = [item for item in candidates if item.get("price_kind") in {"normal", "regular"}]
+        selected = regular or [item for item in candidates if item.get("price_kind") == "historical_average"]
+        if not selected:
+            continue
+
+        # One latest observation per retailer. When a page has no retailer field,
+        # use its source domain as a conservative grouping key.
+        latest_by_outlet: dict[str, dict] = {}
+        for item in sorted(selected, key=lambda value: (
+            value.get("_estimate_checked_date"), value.get("observed_at", "")
+        )):
+            outlet = str(item.get("retailer_name") or item.get("source_domain") or item.get("source_name") or "unknown").casefold()
+            latest_by_outlet[outlet] = item
+        chosen = list(latest_by_outlet.values())
+        prices = [parse_idr_price(item.get("market_price")) for item in chosen]
+        prices = [value for value in prices if value is not None]
+        if not prices:
+            continue
+
+        estimate = int(round(statistics.median(prices)))
+        source_domains = sorted({str(item.get("source_domain") or item.get("source_name") or "") for item in chosen if item.get("source_domain") or item.get("source_name")})
+        retailers = sorted({str(item.get("retailer_name") or "").strip() for item in chosen if str(item.get("retailer_name") or "").strip()})
+        latest_checked = max(item["_estimate_checked_date"] for item in chosen)
+        worst_age = max(item["_estimate_age_days"] for item in chosen)
+        used_historical_average = not regular
+        is_tokku = any(str(item.get("source_domain") or "").casefold().removeprefix("www.") == "tokku.app" for item in chosen)
+
+        row["estimated_normal_price"] = estimate
+        row["estimated_normal_low"] = min(prices)
+        row["estimated_normal_high"] = max(prices)
+        row["estimated_normal_basis"] = "historical_average_3m" if used_historical_average else "median_regular_retailer_prices"
+        row["estimated_normal_sources"] = " | ".join(source_domains)
+        row["estimated_normal_retailers"] = " | ".join(retailers) or None
+        row["estimated_normal_source_urls"] = " | ".join(sorted({item.get("source_url", "") for item in chosen if item.get("source_url")}))
+        row["estimated_normal_observed_at"] = latest_checked.isoformat()
+        row["estimated_normal_age_days"] = worst_age
+        row["estimated_normal_observation_count"] = len(prices)
+        # Tokku's own terms warn that automated product matching may be imperfect.
+        # Never label an estimate from a single aggregator as high confidence.
+        if used_historical_average:
+            confidence = "low"
+        elif len(prices) >= 3:
+            confidence = "medium"
+        else:
+            confidence = "low"
+        row["estimated_normal_confidence"] = confidence
+        row["estimated_normal_status"] = "estimated_from_manual_price_evidence"
+        if used_historical_average:
+            row["estimated_normal_note"] = "Rata-rata historis 3 bulan; dapat mencakup harga promo, bukan harga normal resmi. Tidak dipakai menghitung diskon resmi."
+            summary["historical_average_estimates"] += 1
+        elif is_tokku:
+            row["estimated_normal_note"] = "Median harga retailer yang ditandai normal/reguler dan dicocokkan manual sebagai SKU exact di Tokku. Bukan harga asli resmi merchant promo."
+            summary["tokku_estimates"] += 1
+        else:
+            row["estimated_normal_note"] = "Median observasi harga retailer yang ditandai normal/reguler. Bukan harga asli resmi merchant promo."
+        summary["rows_estimated"] += 1
+    return summary
+
+
 def compare_market_prices(rows: list[dict], references: list[dict], today: date | None = None, max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict:
     """Attach market median only when same exact product/size/variant evidence matches."""
     today = today or date.today()
     by_product: dict[str, list[dict]] = {}
     for raw in references:
         row = _normalize_record(raw)
-        observed = _parse_date(row.get("observed_at"))
+        # Tokku and other comparison pages expose a source-side "last checked"
+        # date. Prefer that over the user's manual capture date; a page opened
+        # today can still contain a price last checked months ago.
+        observed = _parse_date(row.get("source_checked_at")) or _parse_date(row.get("observed_at"))
         price = parse_idr_price(row.get("market_price"))
+        kind = str(row.get("price_kind") or "market").casefold()
+        if kind in {"promo", "unknown", "historical_min", "historical_average"}:
+            continue
         if not observed or observed > today or (today - observed).days > max_age_days or price is None:
             continue
         by_product.setdefault(row.get("product_key", ""), []).append(row)
