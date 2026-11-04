@@ -4,8 +4,6 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib
-from importlib import metadata
-import re
 import sys
 from pathlib import Path
 
@@ -18,23 +16,13 @@ RUNTIME_MODULES = {
 DEV_MODULES = {
     "pytest": "pytest (only needed for the offline regression suite)",
 }
-RECOMMENDED_VERSIONS = {
-    "requests": "2.34.2",
-    "beautifulsoup4": "4.15.0",
-    "openpyxl": "3.1.5",
-    "pytest": "9.2.0",
-}
-
-
-def _version_tuple(value: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in re.findall(r"\d+", value)[:3])
 
 
 def check_runtime(*, dev: bool = False) -> list[str]:
     """Check importable modules for a runtime-only or runtime+dev environment."""
     issues: list[str] = []
     if sys.version_info < (3, 11):
-        issues.append(f"Python 3.11+ dibutuhkan; ditemukan {sys.version.split()[0]}. Python 3.10 sudah EOL.")
+        issues.append(f"Python 3.11+ dibutuhkan; Python 3.10 sudah EOL sejak 1 Oktober 2026. Ditemukan {sys.version.split()[0]}.")
 
     try:
         prefix = Path(sys.prefix).resolve()
@@ -50,33 +38,20 @@ def check_runtime(*, dev: bool = False) -> list[str]:
     modules = dict(RUNTIME_MODULES)
     if dev:
         modules.update(DEV_MODULES)
-    package_versions: dict[str, str] = {}
     for module_name, display_name in modules.items():
         try:
             importlib.import_module(module_name)
         except Exception as exc:  # import errors can also be broken binary deps
             issues.append(f"Modul {display_name} tidak bisa diimpor ({type(exc).__name__}: {exc}).")
-            continue
-        distribution = "beautifulsoup4" if module_name == "bs4" else module_name
-        try:
-            installed = metadata.version(distribution)
-            package_versions[distribution] = installed
-            recommended = RECOMMENDED_VERSIONS.get(distribution)
-            if recommended and _version_tuple(installed) < _version_tuple(recommended):
-                print(
-                    f"Peringatan: {distribution} {installed} masih dapat dipakai bila kompatibel, "
-                    f"tetapi versi rekomendasi proyek saat ini >= {recommended}. "
-                    "Tidak ada pembaruan otomatis."
-                )
-        except metadata.PackageNotFoundError:
-            print(f"Peringatan: versi distribusi {distribution} tidak dapat diidentifikasi.")
 
     if not issues:
         print(f"Python: {sys.version.split()[0]}")
         print(f"Executable: {sys.executable}")
         print(f"Prefix: {sys.prefix}")
-        for distribution, installed in package_versions.items():
-            print(f"  {distribution}: {installed}")
+        names = ", ".join(RUNTIME_MODULES)
+        if dev:
+            names += ", pytest"
+        print(f"Modul tersedia: {names}")
         print("Tidak ada venv atau paket yang dibuat/diinstal.")
     return issues
 

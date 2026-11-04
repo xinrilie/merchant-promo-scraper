@@ -9,7 +9,6 @@ from collections import Counter, OrderedDict, defaultdict
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from urllib.parse import urlparse
 import math
 
 from promo_names import (
@@ -34,7 +33,9 @@ from promo_price_reference import (
     find_reference_price, EXPLICIT_NORMAL_PRICE_LABEL_RE,
 )
 from promo_market_prices import (
-    MARKET_REFERENCE_CSV, load_market_reference_database, compare_market_prices,
+    MARKET_REFERENCE_CSV, initialize_market_reference_database,
+    load_market_reference_database, compare_market_prices,
+    estimate_normal_prices_from_references,
 )
 
 ENGINE_DIR = Path(__file__).resolve().parent
@@ -77,6 +78,11 @@ FIELDS = [
     "market_reference_source_count", "market_reference_sources", "market_reference_source_urls",
     "market_reference_observed_at", "market_reference_status", "market_reference_below_median_percent",
     "market_reference_savings", "market_reference_confidence", "market_reference_note",
+    "estimated_normal_price", "estimated_normal_low", "estimated_normal_high",
+    "estimated_normal_basis", "estimated_normal_sources", "estimated_normal_retailers",
+    "estimated_normal_source_urls", "estimated_normal_observed_at", "estimated_normal_age_days",
+    "estimated_normal_observation_count", "estimated_normal_confidence", "estimated_normal_status",
+    "estimated_normal_note",
     "discount_percent", "discount_percent_basis",
     "discount_percent_confidence", "discount_percent_calculated", "discount_savings_rp",
     "estimated_bundle_discount_percent", "campaign_discount_percent",
@@ -2561,6 +2567,17 @@ CLEAN_COLUMNS = [
     ("Harga Asli dari Sumber (Rp)", "normal_price"),
     ("Harga Normal Referensi (Rp)", "reference_normal_price"),
     ("Rentang Referensi Harga (Rp)", "reference_price_range_display"),
+    ("Harga Normal Estimasi Pasar (Rp)", "estimated_normal_price"),
+    ("Rentang Estimasi Harga Normal (Rp)", "estimated_normal_range_display"),
+    ("Dasar Estimasi Harga Normal", "estimated_normal_basis_display"),
+    ("Sumber Estimasi Harga Normal", "estimated_normal_sources"),
+    ("Retailer Pembanding Estimasi", "estimated_normal_retailers"),
+    ("Jumlah Observasi Estimasi", "estimated_normal_observation_count"),
+    ("Tanggal Update Data Harga", "estimated_normal_observed_at"),
+    ("Umur Data Harga (hari)", "estimated_normal_age_days"),
+    ("Keyakinan Estimasi Harga Normal", "estimated_normal_confidence"),
+    ("Status Estimasi Harga Normal", "estimated_normal_status"),
+    ("URL Referensi Estimasi Harga Normal", "estimated_normal_source_urls"),
     ("Dasar Diskon", "discount_basis_label"),
     ("Status Promo", "display_status"),
     ("Mulai Berlaku", "valid_from"),
@@ -2593,7 +2610,7 @@ CLEAN_COLUMNS = [
     ("Detail Penawaran", "offer_text"),
     ("Kampanye", "campaign_title"),
     ("Catatan", "display_notes"),
-    ("Sumber URL", "display_source_url"),
+    ("Sumber URL", "source_url"),
 ]
 
 
@@ -2658,54 +2675,8 @@ def clean_sort_key(row):
     return (-discount, (row.get("Merchant") or "").casefold(), (row.get("Nama Produk") or "").casefold())
 
 
-HEMAT_RETAILER_CATALOG_URLS = {
-    "alfamart": "https://www.hemat.id/katalog-alfamart/",
-    "indomaret": "https://www.hemat.id/katalog-indomaret/",
-    "alfamidi": "https://www.hemat.id/katalog-alfamidi/",
-    "super indo": "https://www.hemat.id/katalog-superindo/",
-    "superindo": "https://www.hemat.id/katalog-superindo/",
-    "hypermart": "https://www.hemat.id/katalog-hypermart/",
-    "yogya": "https://www.hemat.id/katalog-yogya/",
-    "tip top": "https://www.hemat.id/katalog-tip-top/",
-    "tiptop": "https://www.hemat.id/katalog-tip-top/",
-}
-
-
-def preferred_source_url(row):
-    """Prefer a product detail URL; keep legacy comparison pages out of the main catalog link."""
-    item_url = str(row.get("source_item_url") or "").strip()
-    if item_url:
-        parsed_item = urlparse(item_url)
-        item_path = parsed_item.path.lower()
-        is_specific_hemat_item = (
-            (parsed_item.hostname or "").lower().removeprefix("www.") == "hemat.id"
-            and (
-                item_path.startswith("/harga/")
-                or item_path.startswith("/harga-")
-                or bool(re.fullmatch(r"/katalog/[^/]+/", item_path))
-            )
-        )
-        if is_specific_hemat_item:
-            return item_url
-
-    source_url = str(row.get("source_url") or row.get("source_page_url") or "").strip()
-    parsed_source = urlparse(source_url)
-    source_path = parsed_source.path.lower()
-    is_hemat_comparison = (
-        (parsed_source.hostname or "").lower().removeprefix("www.") == "hemat.id"
-        and bool(re.search(r"/katalog-[^/]*,[^/]*/", source_path))
-    )
-    if is_hemat_comparison:
-        merchant = re.sub(r"\s+", " ", str(row.get("merchant_name") or "").strip().casefold())
-        canonical = HEMAT_RETAILER_CATALOG_URLS.get(merchant)
-        if canonical:
-            return canonical
-    return source_url or item_url
-
-
 def make_clean_row(row, review=False):
     item = dict(row)
-    item["display_source_url"] = preferred_source_url(row)
     item["display_status"] = display_status(row)
     item["product_quality_label"] = product_validation_display(row)
     item["display_deal_type"] = row.get("deal_type") or row.get("campaign_type") or ""
@@ -2736,6 +2707,17 @@ def make_clean_row(row, review=False):
         item["reference_price_range_display"] = f"Rp{low:,}–Rp{high:,}".replace(",", ".")
     else:
         item["reference_price_range_display"] = None
+    estimated_low = as_int(row.get("estimated_normal_low"))
+    estimated_high = as_int(row.get("estimated_normal_high"))
+    if estimated_low is not None and estimated_high is not None:
+        item["estimated_normal_range_display"] = f"Rp{estimated_low:,}–Rp{estimated_high:,}".replace(",", ".")
+    else:
+        item["estimated_normal_range_display"] = None
+    estimate_basis = str(row.get("estimated_normal_basis") or "")
+    item["estimated_normal_basis_display"] = {
+        "median_regular_retailer_prices": "Median harga retailer reguler; estimasi pasar, bukan harga asli resmi",
+        "historical_average_3m": "Rata-rata historis 3 bulan; dapat mencakup promo",
+    }.get(estimate_basis, estimate_basis or None)
     market_low = as_int(row.get("market_reference_low"))
     market_high = as_int(row.get("market_reference_high"))
     if market_low is not None and market_high is not None:
@@ -3402,7 +3384,7 @@ def make_simple_excel_row(row):
         "Penawaran": offer or "—",
         "Status Promo": display_status(row),
         "Verifikasi Sumber": row.get("source_verification_label") or source_verification_label(row.get("verification_status")),
-        "Sumber URL": clean.get("Sumber URL") or "",
+        "Sumber URL": row.get("source_url") or "",
         "_discount_numeric": isinstance(discount_cell, (int, float)),
         "_discount_basis": calculation_basis or existing_basis,
         "_review_required": (
@@ -3883,7 +3865,7 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
             ws.append([row.get(h) for h in headers])
         width_by_header = {
             "Nama Produk": 38, "Kategori Produk": 31, "Subkategori": 28,
-            "Harga Asli (Rp)": 16, "Basis Harga Asli": 40, "Harga Asli dari Sumber (Rp)": 18, "Harga Normal Referensi (Rp)": 20, "Rentang Referensi Harga (Rp)": 24, "Harga Promo (Rp)": 15,
+            "Harga Asli (Rp)": 16, "Basis Harga Asli": 40, "Harga Asli dari Sumber (Rp)": 18, "Harga Normal Referensi (Rp)": 20, "Rentang Referensi Harga (Rp)": 24, "Harga Normal Estimasi Pasar (Rp)": 24, "Rentang Estimasi Harga Normal (Rp)": 28, "Dasar Estimasi Harga Normal": 44, "Sumber Estimasi Harga Normal": 35, "Retailer Pembanding Estimasi": 40, "Jumlah Observasi Estimasi": 18, "Tanggal Update Data Harga": 24, "Umur Data Harga (hari)": 18, "Keyakinan Estimasi Harga Normal": 26, "Status Estimasi Harga Normal": 34, "URL Referensi Estimasi Harga Normal": 60, "Harga Promo (Rp)": 15,
             "Diskon (%)": 12, "Dasar Diskon": 38, "Status Referensi Harga": 42, "Merchant": 22, "Merchant Acuan Referensi": 24,
             "Median Harga Pasar (Rp)": 20, "Rentang Harga Pasar (Rp)": 24, "Lebih Murah dari Median Pasar (%)": 22,
             "Selisih terhadap Median Pasar (Rp)": 22, "Jumlah Domain Pembanding": 18, "Status Pembanding Pasar": 42,
@@ -3907,7 +3889,7 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
             for col_cells in ws.iter_rows(min_row=2, min_col=idx, max_col=idx):
                 cell = col_cells[0]
                 cell.alignment = Alignment(vertical="top", wrap_text=field in {"Nama Produk", "Kategori Produk", "Subkategori", "Kesegaran Data", "Klaim Diskon Sumber (Review) (%)", "Detail Penawaran", "Kampanye", "Catatan", "Sumber URL", "URL Referensi Harga", "URL Pembanding Pasar", "Sumber Pembanding Pasar", "Dasar Diskon", "Sumber Referensi Harga", "Alasan Review"})
-                if field in {"Harga Asli (Rp)", "Harga Asli dari Sumber (Rp)", "Harga Normal Referensi (Rp)", "Harga Promo (Rp)", "Hemat / Selisih Referensi (Rp)"}:
+                if field in {"Harga Asli (Rp)", "Harga Asli dari Sumber (Rp)", "Harga Normal Referensi (Rp)", "Harga Normal Estimasi Pasar (Rp)", "Harga Promo (Rp)", "Hemat / Selisih Referensi (Rp)"}:
                     cell.number_format = '#,##0'
                 elif field == "Diskon (%)":
                     cell.number_format = '0.0"%"'
@@ -4433,6 +4415,7 @@ def main():
     price_reference_update = update_reference_database(PRICE_REFERENCE_CSV, all_loaded_rows, TODAY)
     all_price_reference_records = load_reference_database(PRICE_REFERENCE_CSV)
     price_reference_records = [r for r in all_price_reference_records if r.get("record_origin") != "user_supplied_estimate"]
+    market_reference_init = initialize_market_reference_database(MARKET_REFERENCE_CSV)
     market_reference_records = load_market_reference_database(MARKET_REFERENCE_CSV)
     print("Observasi harga normal baru tersimpan:", price_reference_update.get("observations_added", 0))
     print("Referensi harga normal bersumber tersedia:", len(price_reference_records))
@@ -4449,6 +4432,11 @@ def main():
     consolidated, equivalent_offer_groups, equivalent_offer_rows_absorbed = merge_equivalent_cross_source_offers(consolidated)
     price_reference_apply_summary = apply_price_reference(consolidated, price_reference_records, today=TODAY)
     market_price_apply_summary = compare_market_prices(consolidated, market_reference_records, today=TODAY)
+    estimated_normal_summary = estimate_normal_prices_from_references(consolidated, market_reference_records, today=TODAY)
+    print("Database harga pasar lokal:", MARKET_REFERENCE_CSV.relative_to(ROOT_DIR), f"({market_reference_init})")
+    print("Estimasi harga normal pasar dari referensi manual:", estimated_normal_summary.get("rows_estimated", 0))
+    print(" - Referensi Tokku manual:", estimated_normal_summary.get("tokku_estimates", 0))
+    print(" - Rata-rata historis 3 bulan:", estimated_normal_summary.get("historical_average_estimates", 0))
 
     # Quality gate: a row can have an active period and still be unfit for the
     # public-facing catalog. Quarantine identity, merchant, category, source-link,
