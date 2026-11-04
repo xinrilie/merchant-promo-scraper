@@ -108,3 +108,17 @@ def test_health_summary_exposes_promo_history_metrics_and_partial_status():
     assert result["promo_history"]["expired_records_retained_in_history"] == 45
     assert result["sources"]["Hemat.id"]["health"] == "healthy_with_warnings"
     assert result["_exit_code"] == 0
+
+
+def test_launcher_import_price_mode_reuses_runtime_interpreter_without_pytest():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    batch = (root / "run.bat").read_text(encoding="utf-8")
+    assert '"--import-price-research" set "MODE=import"' in batch
+    assert 'if /I "%MODE%"=="import" set "CHECK_ARGS="' in batch
+    assert 'if /I "%MODE%"=="import" goto :import_price_research' in batch
+    assert 'src\\import_manual_price_references.py' in batch
+    assert 'src\\enrich_existing_promo_catalog_multisource.py' in batch
+    assert 'src\\verify_outputs.py' in batch
+    assert 'if /I not "%MODE%"=="import" echo Mode ini juga memerlukan pytest' in batch
