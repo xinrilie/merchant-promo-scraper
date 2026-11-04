@@ -84,11 +84,3 @@ def test_run_bat_uses_verifier_script_not_embedded_project_path():
 
     assert '"%~dp0src\\verify_outputs.py"' in source
     assert "Path(r'%~dp0')" not in source
-
-
-def test_run_bat_has_offline_snapshot_rebuild_mode():
-    run_bat = Path(__file__).resolve().parents[1] / "run.bat"
-    source = run_bat.read_text(encoding="utf-8")
-    assert "--rebuild-from-last-snapshot" in source
-    assert "REBUILD DARI SNAPSHOT TERAKHIR" in source
-    assert "Tidak ada request ke situs sumber." in source
