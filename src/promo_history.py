@@ -38,6 +38,14 @@ HISTORY_FIELDS = (
     "retention_reason",
 )
 DEFAULT_UNKNOWN_PERIOD_GRACE_DAYS = 14
+# A valid end date is not enough to keep a row in the current catalogue forever.
+# Offers unseen for too long remain in history but leave the current snapshot.
+SOURCE_CARRY_FORWARD_MAX_AGE_DAYS = {
+    "Hemat.id": 21,
+    "Katalogpromosi.com": 14,
+    "Scanharga.com": 7,
+}
+DEFAULT_CARRY_FORWARD_MAX_AGE_DAYS = 14
 
 
 def _text(value: object) -> str:
@@ -148,7 +156,9 @@ def promo_family_key(row: dict) -> str:
 
 
 def current_promo_status(row: dict, today: date) -> str:
-    """Recalculate temporal status; a known past end date always means expired."""
+    """Recalculate temporal status while honoring explicit source-side expiry labels."""
+    if _truthy(row.get("source_explicit_expired")) or _text(row.get("promo_status")).casefold() == "expired":
+        return "expired"
     start = _parse_iso_date(row.get("valid_from"))
     end = _parse_iso_date(row.get("valid_until"))
     if end and end < today:
@@ -304,6 +314,8 @@ def update_history(
 
     for history_id, row in indexed.items():
         status = current_promo_status(row, current_date)
+        if history_id not in observed_ids and row.get("history_record_status") != "superseded":
+            row["presence_status"] = "not_seen_this_run"
         row["history_promo_status"] = status
         row["history_status_as_of"] = current_date.isoformat()
         if status == "expired" and row.get("history_record_status") != "superseded":
@@ -322,31 +334,75 @@ def carry_forward_rows(
     *,
     today: date,
     unknown_period_grace_days: int = DEFAULT_UNKNOWN_PERIOD_GRACE_DAYS,
+    decision_summary: dict | None = None,
 ) -> list[dict]:
-    """Carry unseen offers only while dated-valid or briefly unverified."""
+    """Carry unseen offers only within source-specific freshness windows.
+
+    Dated-valid offers can leave the current snapshot when not observed for too
+    long, but they remain untouched in persistent history. Scanharga receives a
+    shorter window because the current collector mostly discovers articles/images
+    there and yields comparatively few textual product rows.
+    """
     observed_ids = {promo_event_key(row) for row in observed_rows if not _truthy(row.get("retained_from_previous_run"))}
     observed_families = {promo_family_key(row) for row in observed_rows if not _truthy(row.get("retained_from_previous_run"))}
     carry: list[dict] = []
+    stats = {
+        "eligible_history_rows_considered": 0,
+        "carried_forward_rows": 0,
+        "not_carried_expired": 0,
+        "not_carried_superseded": 0,
+        "not_carried_observed_or_replaced": 0,
+        "not_carried_stale": 0,
+        "not_carried_unknown_period_grace_exceeded": 0,
+        "carried_forward_by_source": {},
+        "source_max_age_days": dict(SOURCE_CARRY_FORWARD_MAX_AGE_DAYS),
+    }
+    by_source: dict[str, int] = {}
     for raw in history_rows:
         row = dict(raw)
+        stats["eligible_history_rows_considered"] += 1
         history_id = _text(row.get("history_id")) or promo_event_key(row)
-        if history_id in observed_ids:
+        if history_id in observed_ids or promo_family_key(row) in observed_families:
+            stats["not_carried_observed_or_replaced"] += 1
             continue
         if _text(row.get("history_record_status")) == "superseded":
-            continue
-        if promo_family_key(row) in observed_families:
+            stats["not_carried_superseded"] += 1
             continue
         status = current_promo_status(row, today)
         if status == "expired":
+            stats["not_carried_expired"] += 1
             continue
         last_seen = _parse_timestamp(row.get("last_seen_at") or row.get("scraped_at"))
         days_since = max(0, (today - last_seen.date()).days) if last_seen else None
+        source_names = list(dict.fromkeys(
+            _split_pipe(row.get("history_source_names"))
+            + source_names_for(row)
+        ))
+        known_limits = [SOURCE_CARRY_FORWARD_MAX_AGE_DAYS[name] for name in source_names if name in SOURCE_CARRY_FORWARD_MAX_AGE_DAYS]
+        # If an offer has independent evidence from several sources, allow the
+        # longest applicable window; it is not treated as Scanharga-only data.
+        max_age = max(known_limits) if known_limits else DEFAULT_CARRY_FORWARD_MAX_AGE_DAYS
+        if days_since is None or days_since > max_age:
+            stats["not_carried_stale"] += 1
+            if isinstance(raw, dict):
+                raw["presence_status"] = "not_seen_beyond_carry_window"
+                raw["retention_reason"] = f"Tidak masuk snapshot saat ini karena tidak ditemukan selama {days_since if days_since is not None else 'jumlah hari tidak diketahui'} hari; batas sumber {max_age} hari. Riwayat tetap disimpan."
+                raw["history_status_as_of"] = today.isoformat()
+                raw["days_since_last_seen"] = days_since if days_since is not None else ""
+            continue
         if status == "unknown":
-            if days_since is None or days_since > unknown_period_grace_days:
+            grace = min(unknown_period_grace_days, max_age)
+            if days_since > grace:
+                stats["not_carried_unknown_period_grace_exceeded"] += 1
+                if isinstance(raw, dict):
+                    raw["presence_status"] = "not_seen_beyond_review_grace"
+                    raw["retention_reason"] = f"Periode belum jelas dan melewati masa review {grace} hari; tidak dimasukkan ke snapshot, tetapi riwayat tetap disimpan."
+                    raw["history_status_as_of"] = today.isoformat()
+                    raw["days_since_last_seen"] = days_since
                 continue
-            reason = f"Periode belum jelas; dipertahankan maksimal {unknown_period_grace_days} hari sejak observasi terakhir untuk review."
+            reason = f"Periode belum jelas; dipertahankan maksimal {grace} hari sejak observasi terakhir untuk review."
         else:
-            reason = "Tidak terlihat pada run terbaru; dipertahankan karena periode promo belum berakhir."
+            reason = f"Tidak terlihat pada run terbaru; dipertahankan maksimal {max_age} hari sejak observasi terakhir dan selama periode promo belum berakhir."
         row.update({
             "retained_from_previous_run": "true",
             "presence_status": "not_seen_this_run",
@@ -354,10 +410,18 @@ def carry_forward_rows(
             "history_promo_status": status,
             "history_status_as_of": today.isoformat(),
             "history_record_status": "current_or_unverified",
-            "days_since_last_seen": days_since if days_since is not None else "",
+            "days_since_last_seen": days_since,
             "retention_reason": reason,
+            "carry_forward_max_age_days": max_age,
         })
         carry.append(row)
+        stats["carried_forward_rows"] += 1
+        bucket = " + ".join(source_names) if source_names else "Unknown source"
+        by_source[bucket] = by_source.get(bucket, 0) + 1
+    stats["carried_forward_by_source"] = dict(sorted(by_source.items()))
+    if decision_summary is not None:
+        decision_summary.clear()
+        decision_summary.update(stats)
     return carry
 
 

@@ -215,3 +215,27 @@ def test_duplicate_fixes_regressions():
 
 if __name__ == "__main__":
     test_duplicate_fixes_regressions()
+
+
+def test_canonical_package_signature_normalizes_metric_units_without_collapsing_pack_structure():
+    from promo_names import product_name_package_match_signature, product_name_matching_key
+
+    assert product_name_package_match_signature("Susu UHT Full Cream 1.8 L") == product_name_package_match_signature("Susu UHT Full Cream 1800 ml")
+    assert product_name_matching_key("Minyak Goreng 1 kg") == product_name_matching_key("Minyak Goreng 1000 g")
+    assert product_name_matching_key("Susu 2 x 500 ml") == product_name_matching_key("Susu 2x0.5 L")
+    assert product_name_matching_key("Susu 2 x 500 ml") != product_name_matching_key("Susu 1 L")
+    assert product_name_matching_key("Mie Instan 10 x 27 g") != product_name_matching_key("Mie Instan 270 g")
+
+
+def test_canonical_package_signature_keeps_variant_tokens_exact():
+    from promo_names import product_name_matching_key
+
+    assert product_name_matching_key("Susu UHT Cokelat 1 L") != product_name_matching_key("Susu UHT Full Cream 1000 ml")
+
+
+def test_indonesian_thousands_notation_in_product_size_is_normalized_safely():
+    from promo_names import product_name_package_match_signature, clean_product_name
+
+    assert clean_product_name("Minyak Goreng 1.000 ml") == "Minyak Goreng 1000 ml"
+    assert product_name_package_match_signature("Minyak Goreng 1.000 ml") == product_name_package_match_signature("Minyak Goreng 1 L")
+    assert product_name_package_match_signature("Minyak Goreng 1,5 L") == product_name_package_match_signature("Minyak Goreng 1500 ml")

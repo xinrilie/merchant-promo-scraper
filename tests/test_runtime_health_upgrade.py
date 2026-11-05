@@ -122,3 +122,33 @@ def test_launcher_import_price_mode_reuses_runtime_interpreter_without_pytest():
     assert 'src\\enrich_existing_promo_catalog_multisource.py' in batch
     assert 'src\\verify_outputs.py' in batch
     assert 'if /I not "%MODE%"=="import" echo Mode ini juga memerlukan pytest' in batch
+
+
+def test_health_summary_preserves_source_role_explanation_and_yield_metrics():
+    now = datetime(2026, 11, 4, 9, 0, tzinfo=JAKARTA)
+    log = {
+        "built_at": "2026-11-04T08:59:00+07:00",
+        "source_health": {
+            "Hemat.id": {"status": "fresh", "product_rows_in_output": 5, "fresh_product_rows": 5},
+            "Katalogpromosi.com": {"status": "fresh", "product_rows_in_output": 4, "fresh_product_rows": 4},
+            "Scanharga.com": {
+                "status": "fresh_with_preserved", "product_rows_in_output": 20,
+                "fresh_product_rows": 2, "preserved_previous_rows": 18,
+                "source_role": "discovery_support",
+                "source_role_note": "Utamakan artikel dan URL gambar.",
+                "discovered_article_pages": 30,
+                "articles_with_textual_product_rows": 2,
+                "textual_product_rows_from_articles": 2,
+                "image_references_found": 179,
+                "fresh_product_rows_per_article": 0.067,
+            },
+        },
+    }
+    result = build_summary(log, now=now)
+    source = result["sources"]["Scanharga.com"]
+    assert source["source_role"] == "discovery_support"
+    assert source["source_role_note"] == "Utamakan artikel dan URL gambar."
+    assert source["discovered_article_pages"] == 30
+    assert source["articles_with_textual_product_rows"] == 2
+    assert source["image_references_found"] == 179
+    assert source["fresh_product_rows_per_article"] == 0.067

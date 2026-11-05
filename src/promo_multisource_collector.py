@@ -27,7 +27,10 @@ import requests
 from bs4 import BeautifulSoup
 
 from promo_names import clean_product_name, name_variants
-from promo_merchant_utils import infer_merchant_candidate_from_title, infer_merchant_candidate_from_url, is_dynamic_merchant_label
+from promo_merchant_utils import (
+    infer_merchant_candidate_from_title, infer_merchant_candidate_from_url,
+    infer_hemat_retailer_from_item_url, is_dynamic_merchant_label,
+)
 from promo_product_validation import product_candidate_rejection_reason, product_candidate_review_reason
 from promo_evidence import find_amount_evidence, find_discount_evidence, extract_period_evidence
 from promo_categories import classify_promo_category
@@ -169,7 +172,8 @@ NOISE_START = re.compile(
 
 PRODUCT_FIELDS = [
     "product_text", "original_product_text", "product_name_variants", "product_category", "product_subcategory", "normal_price", "promo_price", "discount_percent",
-    "merchant_name", "discount_savings_rp", "discount_note", "deal_type",
+    "merchant_name", "merchant_resolution_method", "merchant_evidence_text",
+    "discount_savings_rp", "discount_note", "deal_type",
     "purchase_condition", "offer_text", "valid_from", "valid_until",
     "period_precision", "promo_status", "campaign_title", "campaign_type", "published_at",
     "source_name", "source_type", "verification_status", "source_url",
@@ -177,7 +181,9 @@ PRODUCT_FIELDS = [
     "price_parse_method", "price_basis", "discount_basis", "price_quality_flag",
     "promo_price_evidence_text", "normal_price_evidence_text", "discount_evidence_text",
     "period_evidence_text", "period_evidence_source",
-    "raw_line", "retained_from_previous_run", "product_validation_status", "product_review_reason",
+    "source_explicit_expired", "source_status_evidence_text",
+    "raw_line", "retained_from_previous_run", "source_fresh_names", "source_preserved_names",
+    "product_validation_status", "product_review_reason",
     "history_id", "first_seen_at", "last_seen_at", "last_seen_run_id", "seen_count",
     "presence_status", "history_promo_status", "history_record_status",
     "days_since_last_seen", "history_source_names", "history_source_urls",
@@ -762,12 +768,29 @@ def published_from_page(soup: BeautifulSoup) -> str | None:
 
 
 def nearest_context(anchor) -> tuple[str, str | None]:
-    """Find compact nearby HTML context containing the card end date/retailer."""
+    """Find the smallest single-product card context, avoiding neighboring cards.
+
+    Comparison/listing wrappers often contain multiple retailer and product links.
+    We stop before entering a parent that contains another price-bearing product
+    link, so labels such as ``Expired`` or a retailer name cannot leak from a
+    neighboring card into the current product.
+    """
     best_text = clean_text(anchor.get_text(" ", strip=True))
     best_merchant = None
     for parent in anchor.parents:
         if getattr(parent, "name", None) in {"body", "html"}:
             break
+        product_links = []
+        for link in parent.find_all("a"):
+            link_text = clean_text(link.get_text(" ", strip=True))
+            if link is anchor or not link_text:
+                continue
+            if PRICE_SIGNAL.search(link_text):
+                product_links.append(link)
+        # This is a list/grid wrapper rather than the current product card.
+        if product_links:
+            break
+
         text = clean_text(parent.get_text(" ", strip=True))
         if not text:
             continue
@@ -779,16 +802,12 @@ def nearest_context(anchor) -> tuple[str, str | None]:
             if not label or len(label) > 55:
                 continue
             mentioned = merchant_mentions(label)
-            # Consider only labels that identify exactly one retailer. If a card
-            # wrapper contains multiple retailer links, leave it ambiguous.
             if len(mentioned) == 1 and mentioned[0] not in link_merchants:
                 link_merchants.append(mentioned[0])
         merchant = link_merchants[0] if len(link_merchants) == 1 else None
         if merchant and not best_merchant:
             best_merchant = merchant
         elif not merchant:
-            # Do not require a hard-coded alias for a new retailer. A single short
-            # sibling link label in the card context can provide a dynamic candidate.
             dynamic_labels = []
             for link in parent.find_all("a")[:20]:
                 if link is anchor:
@@ -802,12 +821,17 @@ def nearest_context(anchor) -> tuple[str, str | None]:
                     dynamic_labels.append(label)
             if len(dynamic_labels) == 1 and not best_merchant:
                 best_merchant = dynamic_labels[0]
-        if len(text) <= max(700, len(best_text) + 180):
+
+        # Parent traversal moves outward. Keep a compact context and stop as soon
+        # as this single-product card exposes an explicit status or period.
+        if len(text) <= 1000:
             best_text = text
-        if parse_end_only(text) and (merchant or len(text) <= max(700, len(best_text) + 180)):
+        explicit_status = re.search(r"\bexpired\b|\bkedaluwarsa\b", text, re.IGNORECASE)
+        period_evidence = parse_end_only(text)
+        if explicit_status or period_evidence:
             best_text = text
-            if merchant:
-                best_merchant = merchant
+            break
+        if len(text) > 1000:
             break
     return best_text, best_merchant
 
@@ -903,10 +927,16 @@ def extract_hemat_cards(soup: BeautifulSoup, page_url: str) -> list[dict]:
         metadata = parse_promo_metadata(title, "", context)
         # Some listing cards explicitly label an offer as expired without showing
         # a complete date. Honor that card-level label; never borrow another card's date.
-        if re.search(r"\bexpired\b|\bkedaluwarsa\b", context, re.IGNORECASE):
+        expired_match = re.search(r"\bexpired\b|\bkedaluwarsa\b", context, re.IGNORECASE)
+        if expired_match:
             metadata["promo_status"] = "expired"
+            metadata["source_explicit_expired"] = True
+            metadata["source_status_evidence_text"] = expired_match.group(0)
         item_url = safe_url(urljoin(page_url, anchor.get("href", "")))
-        card_merchant = context_merchant or unambiguous_merchant(anchor_text, context)
+        # A retailer prefix in the product-detail URL is stronger than a sibling
+        # link in a broad comparison-page wrapper (which may name another store).
+        item_url_merchant = infer_hemat_retailer_from_item_url(item_url)
+        card_merchant = item_url_merchant or context_merchant or unambiguous_merchant(anchor_text, context)
         if not card_merchant:
             # A single-chain page is a usable fallback; never infer a single chain
             # from a combined listing URL such as /katalog-alfamart,hypermart/.
@@ -919,6 +949,9 @@ def extract_hemat_cards(soup: BeautifulSoup, page_url: str) -> list[dict]:
             meta=metadata, source_url=page_url, source_page_url=page_url,
             source_item_url=item_url, raw_line=anchor_text, source_mode="hemat",
         )
+        if item_url_merchant:
+            row["merchant_resolution_method"] = "hemat_item_url_prefix"
+            row["merchant_evidence_text"] = item_url
         rejection_reason = product_candidate_rejection_reason(row, source_mode="hemat_card")
         if rejection_reason:
             REJECTED_PRODUCT_CANDIDATES.append({
@@ -1325,10 +1358,13 @@ def dedupe_rows(rows: list[dict]) -> list[dict]:
         groups.setdefault(key, []).append(row)
     output = []
     for key, group in groups.items():
-        best = dict(max(group, key=lambda r: sum(bool(r.get(k)) for k in (
-            "merchant_name", "normal_price", "promo_price", "discount_percent",
-            "valid_from", "valid_until", "source_url", "offer_text",
-        ))))
+        best = dict(max(group, key=lambda r: (
+            str(r.get("retained_from_previous_run", "")).strip().casefold() not in {"1", "true", "yes", "ya", "y"},
+            sum(bool(r.get(k)) for k in (
+                "merchant_name", "normal_price", "promo_price", "discount_percent",
+                "valid_from", "valid_until", "source_url", "offer_text",
+            )),
+        )))
         statuses = {str(r.get("product_validation_status") or "eligible") for r in group}
         best["product_validation_status"] = "eligible" if "eligible" in statuses else ("review" if "review" in statuses else "rejected")
         review_reasons = list(OrderedDict.fromkeys(r.get("product_review_reason") for r in group if r.get("product_review_reason")))
@@ -1346,10 +1382,37 @@ def dedupe_rows(rows: list[dict]) -> list[dict]:
         best["product_name_variants"] = " | ".join(variants)
         if variants:
             best["original_product_text"] = variants[0]
-        best["retained_from_previous_run"] = any(
-            str(r.get("retained_from_previous_run", "")).strip().casefold() in {"1", "true", "yes", "ya", "y"}
-            for r in group
-        )
+        # Freshness is tracked per source, not per merged product. A product may
+        # be freshly observed at Hemat while an older copy is carried from
+        # Scanharga. The former must not be counted as preserved just because
+        # one member of the cross-source group was carried forward.
+        fresh_sources: set[str] = set()
+        preserved_sources: set[str] = set()
+        for member in group:
+            member_sources = sources_in_row(member)
+            member_fresh = {
+                part.strip() for part in str(member.get("source_fresh_names") or "").split(" | ")
+                if part.strip()
+            }
+            member_preserved = {
+                part.strip() for part in str(member.get("source_preserved_names") or "").split(" | ")
+                if part.strip()
+            }
+            has_source_map = bool(member_fresh or member_preserved)
+            if has_source_map:
+                fresh_sources.update(member_fresh)
+                preserved_sources.update(member_preserved)
+                # Legacy merged rows may include a source_name not yet represented
+                # in the map. Preserve it conservatively rather than calling it fresh.
+                preserved_sources.update(member_sources - member_fresh - member_preserved)
+            elif str(member.get("retained_from_previous_run", "")).strip().casefold() in {"1", "true", "yes", "ya", "y"}:
+                preserved_sources.update(member_sources)
+            else:
+                fresh_sources.update(member_sources)
+        preserved_sources.difference_update(fresh_sources)
+        best["source_fresh_names"] = " | ".join(sorted(fresh_sources))
+        best["source_preserved_names"] = " | ".join(sorted(preserved_sources))
+        best["retained_from_previous_run"] = not bool(fresh_sources)
         best["duplicate_count"] = len(group)
         best["cross_source_duplicate"] = len(all_names) > 1
         best["duplicate_group_id"] = hashlib.sha1(repr(key).encode("utf-8")).hexdigest()[:12]
@@ -1417,21 +1480,35 @@ def sources_in_row(row: dict) -> set[str]:
     return {piece.strip() for value in values for piece in str(value or "").split(" | ") if piece.strip()}
 
 
-def build_source_health_report(source_names, products, request_log) -> dict:
-    """Summarize per-source request, freshness, and evidence coverage without web access."""
+def build_source_health_report(source_names, products, request_log, articles=(), images=()) -> dict:
+    """Summarize product freshness and article/image discovery yield per source."""
     report = {}
     for source_name in source_names:
         source_requests = [item for item in request_log if item.get("source_name") == source_name]
         source_products = [item for item in products if source_name in sources_in_row(item)]
-        fresh_source_products = [
-            item for item in source_products
-            if str(item.get("retained_from_previous_run", "")).casefold() not in {"true", "1", "yes"}
-        ]
+        fresh_source_products = []
+        preserved_source_products = []
+        for item in source_products:
+            fresh_names = {part.strip() for part in str(item.get("source_fresh_names") or "").split(" | ") if part.strip()}
+            preserved_names = {part.strip() for part in str(item.get("source_preserved_names") or "").split(" | ") if part.strip()}
+            if fresh_names or preserved_names:
+                if source_name in fresh_names:
+                    fresh_source_products.append(item)
+                elif source_name in preserved_names:
+                    preserved_source_products.append(item)
+            elif str(item.get("retained_from_previous_run", "")).casefold() not in {"true", "1", "yes"}:
+                fresh_source_products.append(item)
+            else:
+                preserved_source_products.append(item)
+        source_articles = [item for item in articles if item.get("source_name") == source_name]
+        source_images = [item for item in images if item.get("source_name") == source_name]
+        articles_with_products = sum(int(item.get("product_rows_extracted") or 0) > 0 for item in source_articles)
+        textual_product_rows_from_articles = sum(int(item.get("product_rows_extracted") or 0) for item in source_articles)
         price_rows = [item for item in source_products if item.get("promo_price") not in (None, "")]
         discount_rows = [item for item in source_products if item.get("discount_percent") not in (None, "")]
         period_rows = [item for item in source_products if item.get("promo_status") in {"active", "active_estimated", "upcoming", "upcoming_estimated"}]
         ok_requests = sum(item.get("status") == "ok" for item in source_requests)
-        retained = len(source_products) - len(fresh_source_products)
+        retained = len(preserved_source_products)
         if fresh_source_products and retained:
             status = "fresh_with_preserved"
         elif fresh_source_products and ok_requests:
@@ -1444,7 +1521,23 @@ def build_source_health_report(source_names, products, request_log) -> dict:
             status = "request_failed"
         else:
             status = "no_request"
+
+        if source_name == "Scanharga.com" and len(source_articles) >= 10 and len(fresh_source_products) <= 5 and source_images:
+            source_role = "discovery_support"
+            role_note = (
+                "Utamakan penemuan artikel dan indeks URL gambar; ekstraksi produk tekstual dipertahankan "
+                "sebagai tambahan, bukan sumber utama harga, karena hasil produk segar pada run ini relatif sedikit."
+            )
+        elif source_name == "Scanharga.com":
+            source_role = "product_and_discovery_source"
+            role_note = "Artikel, URL gambar, dan produk tekstual dipertahankan; kelayakan produk tetap ditentukan validasi bukti."
+        else:
+            source_role = "product_and_promo_source"
+            role_note = "Produk tekstual dapat masuk pipeline setelah validasi bukti produk, harga, merchant, dan periode."
+
         report[source_name] = {
+            "source_role": source_role,
+            "source_role_note": role_note,
             "request_count": len(source_requests),
             "successful_requests": ok_requests,
             "failed_requests": sum(item.get("status") in {"request_error", "error", "not_html", "not_found", "gone", "client_error"} for item in source_requests),
@@ -1455,6 +1548,11 @@ def build_source_health_report(source_names, products, request_log) -> dict:
             "product_rows_in_output": len(source_products),
             "fresh_product_rows": len(fresh_source_products),
             "preserved_previous_rows": retained,
+            "discovered_article_pages": len(source_articles),
+            "articles_with_textual_product_rows": articles_with_products,
+            "textual_product_rows_from_articles": textual_product_rows_from_articles,
+            "image_references_found": len(source_images),
+            "fresh_product_rows_per_article": round(len(fresh_source_products) / len(source_articles), 3) if source_articles else None,
             "rows_with_promo_price": len(price_rows),
             "promo_price_evidence_coverage": round(sum(bool(item.get("promo_price_evidence_text")) for item in price_rows) / len(price_rows), 3) if price_rows else None,
             "rows_with_normal_price": sum(item.get("normal_price") not in (None, "") for item in source_products),
@@ -1615,21 +1713,48 @@ def main() -> None:
         history_rows = update_history(
             history_rows, fresh_products, run_id=run_id, now=datetime.now(TZ), today=TODAY
         )
-        save_history(HISTORY_PATH, history_rows)
-        export_history_csv(OUT_HISTORY, history_rows)
-
         # Carry forward previously observed, still-valid offers that did not appear
         # in this scrape. Unknown-period rows receive only a 14-day review grace.
-        carried_products = carry_forward_rows(history_rows, fresh_products, today=TODAY)
+        carry_decisions: dict = {}
+        carried_products = carry_forward_rows(
+            history_rows, fresh_products, today=TODAY, decision_summary=carry_decisions
+        )
+        # Persist the presence/retention decisions as part of the permanent history.
+        save_history(HISTORY_PATH, history_rows)
+        export_history_csv(OUT_HISTORY, history_rows)
         products = dedupe_rows(fresh_products + carried_products)
         for row in products:
             row.setdefault("retained_from_previous_run", False)
             row["review_reason"] = row_review_reason(row)
 
+        fresh_attributions_by_source = Counter()
+        preserved_attributions_by_source = Counter()
+        distinct_rows_with_fresh_source = 0
+        distinct_rows_preserved_only = 0
+        for row in products:
+            fresh_names = {
+                part.strip() for part in str(row.get("source_fresh_names") or "").split(" | ")
+                if part.strip()
+            }
+            preserved_names = {
+                part.strip() for part in str(row.get("source_preserved_names") or "").split(" | ")
+                if part.strip()
+            }
+            for name in fresh_names:
+                fresh_attributions_by_source[name] += 1
+            for name in preserved_names:
+                preserved_attributions_by_source[name] += 1
+            if fresh_names:
+                distinct_rows_with_fresh_source += 1
+            elif preserved_names or str(row.get("retained_from_previous_run", "")).casefold() in {"true", "1", "yes", "ya", "y"}:
+                distinct_rows_preserved_only += 1
+        fresh_attribution_total = sum(fresh_attributions_by_source.values())
+        fresh_cross_source_overlap = max(0, fresh_attribution_total - distinct_rows_with_fresh_source)
+
         active = [r for r in products if r.get("promo_status") in {"active", "active_estimated"} and r.get("product_validation_status") != "review"]
         review = [r for r in products if r.get("review_reason") or r.get("product_validation_status") == "review"]
 
-        source_health = build_source_health_report(SOURCE_SEEDS, products, request_log)
+        source_health = build_source_health_report(SOURCE_SEEDS, products, request_log, all_articles, all_images)
 
         report = {
             "built_at": now_iso(),
@@ -1642,6 +1767,7 @@ def main() -> None:
                 "records_total": len(history_rows),
                 "fresh_observations_this_run": len(fresh_products),
                 "carried_forward_current_or_unverified": len(carried_products),
+                "carry_forward_decisions": carry_decisions,
                 "expired_records_retained_in_history": sum(1 for row in history_rows if row.get("history_promo_status") == "expired"),
                 "superseded_records_retained_in_history": sum(1 for row in history_rows if row.get("history_record_status") == "superseded"),
             },
@@ -1654,10 +1780,19 @@ def main() -> None:
             "request_count": len(request_log),
             "successful_requests": sum(1 for x in request_log if x.get("status") == "ok"),
             "blocked_or_limited_requests": sum(1 for x in request_log if x.get("status") == "blocked_or_limited"),
-            "fresh_product_rows_before_carry_forward": sum(fresh_rows_by_source.values()),
+            "raw_product_rows_scraped_before_dedupe": len(all_products),
+            "raw_product_rows_by_source_before_dedupe": dict(fresh_rows_by_source),
+            "fresh_deduplicated_offer_records": len(fresh_products),
+            "fresh_distinct_offer_rows_in_snapshot": distinct_rows_with_fresh_source,
+            "fresh_source_attributions_by_source": dict(fresh_attributions_by_source),
+            "fresh_source_attribution_total": fresh_attribution_total,
+            "fresh_cross_source_overlap_extra_attributions": fresh_cross_source_overlap,
+            "preserved_source_attributions_by_source": dict(preserved_attributions_by_source),
+            "distinct_rows_preserved_only": distinct_rows_preserved_only,
             "carried_forward_rows": len(carried_products),
-            "all_product_rows_before_dedup": len(fresh_products) + len(carried_products),
+            "rows_before_final_snapshot_dedupe": len(fresh_products) + len(carried_products),
             "product_rows_after_exact_dedup": len(products),
+            "carry_forward_decisions": carry_decisions,
             "active_rows_including_end_date_estimates": len(active),
             "review_rows": len(review),
             "merchant_counts": dict(Counter(r.get("merchant_name") or "UNKNOWN" for r in active)),
@@ -1697,13 +1832,18 @@ def main() -> None:
         ])
         write_json(OUT_LOG, report)
         say("\nSELESAI - MULTI-SOURCE PROMO COLLECTOR")
-        say(f"Baris baru hasil scrape   : {sum(fresh_rows_by_source.values())}")
-        say(f"Baris lama dipertahankan  : {len(carried_products)}")
-        say(f"Riwayat promo tersimpan   : {len(history_rows)}")
-        say(f"Riwayat promo expired     : {sum(1 for row in history_rows if row.get('history_promo_status') == 'expired')}")
-        say(f"Produk sebelum deduplikasi : {len(fresh_products) + len(carried_products)}")
-        say(f"Produk setelah deduplikasi: {len(products)}")
-        say(f"Promo aktif/estimasi      : {len(active)}")
+        say(f"Baris mentah hasil ekstraksi (sebelum deduplikasi): {len(all_products)}")
+        say(f"Penawaran baru unik setelah deduplikasi          : {len(fresh_products)}")
+        say(f"Fresh unik yang terwakili di snapshot             : {distinct_rows_with_fresh_source}")
+        say(f"Atribusi fresh per sumber (bisa overlap)          : {dict(fresh_attributions_by_source)}")
+        say(f"Atribusi ekstra karena produk lintas sumber       : {fresh_cross_source_overlap}")
+        say(f"Baris lama dibawa ke snapshot                    : {len(carried_products)}")
+        say(f"Riwayat promo tersimpan                          : {len(history_rows)}")
+        say(f"Riwayat promo expired                            : {sum(1 for row in history_rows if row.get('history_promo_status') == 'expired')}")
+        say(f"Produk setelah deduplikasi snapshot               : {len(products)}")
+        say(f"Kandidat aktif/estimasi sebelum validasi final    : {len(active)}")
+        say(f"Carry-forward ditolak karena stale                : {carry_decisions.get('not_carried_stale', 0)}")
+        say(f"Carry-forward ditolak karena periode tidak jelas  : {carry_decisions.get('not_carried_unknown_period_grace_exceeded', 0)}")
         say(f"Baris perlu review        : {len(review)}")
         say(f"Referensi gambar katalog  : {len(all_images)}")
         say(f"Kandidat non-produk ditolak: {len(REJECTED_PRODUCT_CANDIDATES)}")

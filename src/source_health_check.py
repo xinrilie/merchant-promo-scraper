@@ -100,10 +100,28 @@ def build_summary(log: dict, *, now: datetime | None = None) -> dict:
             partial_sources += 1
             warnings.append(f"{name}: status tidak dikenali ({status}).")
 
+        if name == "Scanharga.com":
+            source_role = str(raw.get("source_role") or "discovery_support")
+            article_pages = _as_int(raw.get("discovered_article_pages"))
+            fresh_product_yield = raw.get("fresh_product_rows_per_article")
+            image_refs = _as_int(raw.get("image_references_found"))
+            if article_pages >= 10 and fresh_rows <= 5 and image_refs > 0:
+                warnings.append(
+                    f"{name}: lebih efektif sebagai sumber discovery/gambar ({article_pages} artikel, "
+                    f"{image_refs} URL gambar, hanya {fresh_rows} produk segar); jangan menganggapnya sumber utama harga produk."
+                )
+        else:
+            source_role = str(raw.get("source_role") or "product_and_promo_source")
+            article_pages = _as_int(raw.get("discovered_article_pages"))
+            fresh_product_yield = raw.get("fresh_product_rows_per_article")
+            image_refs = _as_int(raw.get("image_references_found"))
+
         usable_rows_total += rows
         sources[name] = {
             "status": status,
             "health": health,
+            "source_role": source_role,
+            "source_role_note": str(raw.get("source_role_note") or ""),
             "request_count": _as_int(raw.get("request_count")),
             "successful_requests": _as_int(raw.get("successful_requests")),
             "failed_requests": failed_requests,
@@ -114,6 +132,11 @@ def build_summary(log: dict, *, now: datetime | None = None) -> dict:
             "product_rows_in_output": rows,
             "fresh_product_rows": fresh_rows,
             "preserved_previous_rows": preserved_rows,
+            "discovered_article_pages": article_pages,
+            "articles_with_textual_product_rows": _as_int(raw.get("articles_with_textual_product_rows")),
+            "textual_product_rows_from_articles": _as_int(raw.get("textual_product_rows_from_articles")),
+            "image_references_found": image_refs,
+            "fresh_product_rows_per_article": fresh_product_yield,
             "rows_with_promo_price": int(raw.get("rows_with_promo_price") or 0),
             "rows_with_normal_price": _as_int(raw.get("rows_with_normal_price")),
             "rows_with_discount": _as_int(raw.get("rows_with_discount")),
@@ -149,6 +172,20 @@ def build_summary(log: dict, *, now: datetime | None = None) -> dict:
         "product_rows_in_source_outputs": usable_rows_total,
         "image_references_found": int(log.get("image_references_found") or 0),
         "promo_history": log.get("promo_history") if isinstance(log.get("promo_history"), dict) else {},
+        "freshness_metrics": {
+            "raw_product_rows_scraped_before_dedupe": _as_int(log.get("raw_product_rows_scraped_before_dedupe")),
+            "fresh_deduplicated_offer_records": _as_int(log.get("fresh_deduplicated_offer_records")),
+            "fresh_distinct_offer_rows_in_snapshot": _as_int(log.get("fresh_distinct_offer_rows_in_snapshot")),
+            "fresh_source_attributions_by_source": log.get("fresh_source_attributions_by_source") if isinstance(log.get("fresh_source_attributions_by_source"), dict) else {},
+            "fresh_source_attribution_total": _as_int(log.get("fresh_source_attribution_total")),
+            "fresh_cross_source_overlap_extra_attributions": _as_int(log.get("fresh_cross_source_overlap_extra_attributions")),
+            "preserved_source_attributions_by_source": log.get("preserved_source_attributions_by_source") if isinstance(log.get("preserved_source_attributions_by_source"), dict) else {},
+            "distinct_rows_preserved_only": _as_int(log.get("distinct_rows_preserved_only")),
+            "carried_forward_rows": _as_int(log.get("carried_forward_rows")),
+            "rows_before_final_snapshot_dedupe": _as_int(log.get("rows_before_final_snapshot_dedupe")),
+            "product_rows_after_exact_dedup": _as_int(log.get("product_rows_after_exact_dedup")),
+            "carry_forward_decisions": log.get("carry_forward_decisions") if isinstance(log.get("carry_forward_decisions"), dict) else {},
+        },
         "ocr_used": False,
         "images_downloaded_for_text_extraction": False,
         "sources": sources,
@@ -182,9 +219,17 @@ def main() -> int:
     print(f"Source health: {summary['overall_status']} | produk di output sumber: {summary['product_rows_in_source_outputs']}")
     for name, source in summary["sources"].items():
         print(
-            f" - {name}: {source['status']} | rows={source['product_rows_in_output']} "
-            f"fresh={source['fresh_product_rows']} preserved={source['preserved_previous_rows']}"
+            f" - {name}: {source['status']} | role={source['source_role']} "
+            f"rows={source['product_rows_in_output']} fresh={source['fresh_product_rows']} "
+            f"preserved={source['preserved_previous_rows']} "
+            f"articles={source['discovered_article_pages']} "
+            f"text_articles={source['articles_with_textual_product_rows']} "
+            f"article_products={source['textual_product_rows_from_articles']} "
+            f"images={source['image_references_found']} "
+            f"fresh_per_article={source['fresh_product_rows_per_article']}"
         )
+        if source.get("source_role_note"):
+            print(f"   Peran sumber: {source['source_role_note']}")
     for warning in summary["warnings"]:
         print(f"PERINGATAN: {warning}")
     print(f"Laporan: {args.output}")

@@ -13,6 +13,7 @@ if /I "%~1"=="--check-only" set "MODE=check"
 if /I "%~1"=="--test-only" set "MODE=test"
 if /I "%~1"=="--prepare-price-research" set "MODE=research"
 if /I "%~1"=="--import-price-research" set "MODE=import"
+if /I "%~1"=="--rebuild-from-last-snapshot" set "MODE=rebuild"
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
 
@@ -131,6 +132,7 @@ echo [PRA-TEST 4/4] Menjalankan tes regresi (tanpa cache lokal)...
 if errorlevel 1 goto :error
 
 if /I "%MODE%"=="test" goto :test_success
+if /I "%MODE%"=="rebuild" goto :rebuild_last_snapshot
 
 echo.
 echo =====================================================
@@ -211,6 +213,29 @@ echo Referensi berhasil diimpor dan katalog diperbarui tanpa scraping live.
 pause
 exit /b 0
 
+:rebuild_last_snapshot
+if not exist "%~dp0runtime\promo_multisource_products_all.csv" goto :snapshot_missing
+if not exist "%~dp0output" mkdir "%~dp0output"
+if not exist "%~dp0state" mkdir "%~dp0state"
+echo.
+echo Rebuild katalog dari snapshot terakhir tanpa mengambil data live...
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\enrich_existing_promo_catalog_multisource.py"
+if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_manual_price_search.py"
+if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% "%~dp0src\verify_outputs.py"
+if errorlevel 1 goto :error
+echo.
+echo Rebuild selesai. Snapshot sumber tidak diambil ulang.
+pause
+exit /b 0
+
+:snapshot_missing
+echo ERROR: runtime\promo_multisource_products_all.csv tidak ditemukan.
+echo Tidak ada snapshot lama untuk dibangun ulang. Jalankan run.bat untuk scraping live terlebih dahulu.
+pause
+exit /b 1
+
 :price_workbook_missing
 echo ERROR: output\Daftar_Cari_Harga_Manual.xlsx tidak ditemukan.
 echo Jalankan run.bat atau run.bat --prepare-price-research dahulu.
@@ -278,6 +303,7 @@ echo   run.bat --test-only  Cek dan tes offline tanpa scraping live
 echo   run.bat --check-only Cek Python/library runtime tanpa menjalankan pipeline
 echo   run.bat --prepare-price-research Buat workbook pencarian harga manual tanpa scraping
 echo   run.bat --import-price-research Impor referensi manual dan rebuild tanpa scraping live
+echo   run.bat --rebuild-from-last-snapshot Rebuild katalog lama tanpa scraping live
 echo   run.bat --help       Tampilkan bantuan
 echo.
 echo Tidak ada pip install otomatis, venv lokal, atau pembacaan teks dari gambar.

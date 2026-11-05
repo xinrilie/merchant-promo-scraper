@@ -344,3 +344,87 @@ def test_same_dated_offer_from_different_aggregator_title_updates_one_history_re
     result = history.update_history([], [first, second], run_id="run-1", now=now, today=date(2026, 11, 3))
     assert len(result) == 1
     assert set(result[0]["history_source_names"].split(" | ")) == {"Hemat.id", "Scanharga.com"}
+
+
+def test_scanharga_only_history_uses_shorter_carry_forward_window_and_keeps_archive():
+    scan = offer()
+    scan.update({
+        "source_name": "Scanharga.com",
+        "source_names": "Scanharga.com",
+        "source_url": "https://scanharga.com/promo/fresh-basket",
+        "source_urls": "https://scanharga.com/promo/fresh-basket",
+        "scraped_at": "2026-10-20T09:00:00+07:00",
+    })
+    history_rows = history.seed_history_from_snapshot(
+        [scan], now=datetime(2026, 10, 20, 9, 0, tzinfo=JAKARTA),
+        today=date(2026, 10, 20),
+    )
+    decisions = {}
+    carried = history.carry_forward_rows(
+        history_rows, [], today=date(2026, 11, 3), decision_summary=decisions
+    )
+    assert carried == []  # Scanharga-only product has exceeded its 7-day window.
+    assert decisions["not_carried_stale"] == 1
+    assert decisions["source_max_age_days"]["Scanharga.com"] == 7
+    assert len(history_rows) == 1  # It remains in permanent history.
+    assert history_rows[0]["presence_status"] == "not_seen_beyond_carry_window"
+    assert "Riwayat tetap disimpan" in history_rows[0]["retention_reason"]
+
+
+def test_multi_source_offer_uses_longest_source_retention_window():
+    mixed = offer()
+    mixed.update({
+        "source_name": "Hemat.id",
+        "source_names": "Hemat.id | Scanharga.com",
+        "history_source_names": "Hemat.id | Scanharga.com",
+        "scraped_at": "2026-10-20T09:00:00+07:00",
+        "last_seen_at": "2026-10-20T09:00:00+07:00",
+    })
+    history_rows = history.seed_history_from_snapshot(
+        [mixed], now=datetime(2026, 10, 20, 9, 0, tzinfo=JAKARTA),
+        today=date(2026, 10, 20),
+    )
+    carried = history.carry_forward_rows(history_rows, [], today=date(2026, 11, 3))
+    assert len(carried) == 1
+    assert carried[0]["carry_forward_max_age_days"] == 21
+
+
+def test_collector_source_health_reports_article_and_image_yield():
+    products = [
+        {"source_name": "Scanharga.com", "product_text": "Only Product 100 g", "retained_from_previous_run": False},
+    ]
+    requests = [
+        {"source_name": "Scanharga.com", "phase": "listing", "status": "ok"},
+        {"source_name": "Scanharga.com", "phase": "article", "status": "ok", "product_rows": 1, "image_count": 10},
+    ]
+    articles = [
+        {"source_name": "Scanharga.com", "product_rows_extracted": 1 if i == 0 else 0}
+        for i in range(12)
+    ]
+    images = [{"source_name": "Scanharga.com", "image_url": f"https://example.test/{i}.jpg"} for i in range(10)]
+    report = collector.build_source_health_report(
+        ["Scanharga.com"], products, requests, articles, images
+    )
+    source = report["Scanharga.com"]
+    assert source["source_role"] == "discovery_support"
+    assert source["discovered_article_pages"] == 12
+    assert source["articles_with_textual_product_rows"] == 1
+    assert source["image_references_found"] == 10
+
+
+def test_hemat_and_katalogpromosi_have_distinct_carry_forward_windows():
+    for source_name, expected_age in (("Hemat.id", 21), ("Katalogpromosi.com", 14)):
+        row = offer()
+        row.update({
+            "source_name": source_name,
+            "source_names": source_name,
+            "history_source_names": source_name,
+            "scraped_at": "2026-10-01T09:00:00+07:00",
+        })
+        seeded = history.seed_history_from_snapshot(
+            [row], now=datetime(2026, 10, 1, 9, 0, tzinfo=JAKARTA),
+            today=date(2026, 10, 1),
+        )
+        assert history.carry_forward_rows(
+            seeded, [], today=date(2026, 10, expected_age + 2)
+        ) == []

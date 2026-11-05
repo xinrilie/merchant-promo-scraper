@@ -16,6 +16,7 @@ from promo_names import (
     clean_product_name, name_variants, product_name_similarity,
     product_names_can_auto_merge, product_name_block_key,
     product_name_size_signature, product_name_variant_signature,
+    load_product_name_aliases,
 )
 from promo_product_validation import PRODUCT_SPEC_RE, product_candidate_rejection_reason, product_candidate_review_reason
 from promo_multisource_collector import (
@@ -23,6 +24,7 @@ from promo_multisource_collector import (
     parse_explicit_discount_amount,
     has_explicit_price_pair,
 )
+from promo_merchant_utils import infer_hemat_retailer_from_item_url
 from promo_evidence import find_amount_evidence, find_discount_evidence, extract_period_evidence, period_certainty, source_verification_label
 from promo_categories import CATEGORY_TAXONOMY, CATEGORY_NAMES, classify_promo_category
 from promo_campaign_utils import (
@@ -31,7 +33,8 @@ from promo_campaign_utils import (
 )
 from promo_price_reference import (
     PRICE_REFERENCE_MAX_AGE_DAYS, REFERENCE_FIELDS, load_reference_database, update_reference_database,
-    find_reference_price, EXPLICIT_NORMAL_PRICE_LABEL_RE,
+    find_reference_price, EXPLICIT_NORMAL_PRICE_LABEL_RE, merchant_key,
+    prepare_reference_candidate_index, suggest_reference_price_candidates, write_price_match_candidates,
 )
 from promo_market_prices import (
     MARKET_REFERENCE_CSV, initialize_market_reference_database,
@@ -53,12 +56,15 @@ OUT_FULL = RUNTIME_DIR / "promo_catalog_multisource_full_audit.csv"
 OUT_REPORT = RUNTIME_DIR / "promo_catalog_multisource_quality_report.json"
 OUT_GATE_REPORT = RUNTIME_DIR / "promo_export_quality_gate_report.json"
 OUT_POSSIBLE_DUPES = RUNTIME_DIR / "promo_possible_duplicate_candidates.csv"
+OUT_PRICE_REFERENCE_QUARANTINE = RUNTIME_DIR / "price_reference_quarantine.csv"
+OUT_PRICE_MATCH_CANDIDATES = RUNTIME_DIR / "price_reference_match_candidates.csv"
 OUT_XLSX = OUTPUT_DIR / "Katalog_Promo_Final.xlsx"
 # Mirrors the simple 13-column "Promo" sheet exactly; the existing main CSV
 # intentionally remains the wider machine-readable catalog with provenance.
 OUT_SIMPLE_CSV = OUTPUT_DIR / "Katalog_Promo_Final_Ringkas.csv"
 OUT_REJECTED_PRODUCTS = RUNTIME_DIR / "promo_product_rows_rejected.csv"
 CATEGORY_REVIEW_LIST_CSV = CONFIG_DIR / "category_review_list.csv"
+PRODUCT_NAME_ALIASES_CSV = CONFIG_DIR / "product_name_aliases.csv"
 PRICE_REFERENCE_SEED_CSV = ROOT_DIR / "data" / "product_price_reference.csv"
 # Mutable observations belong in ignored local state, not in tracked seed data.
 PRICE_REFERENCE_CSV = ROOT_DIR / "state" / "product_price_reference.csv"
@@ -66,13 +72,14 @@ MARKET_CANDIDATES_CSV = ROOT_DIR / "data" / "product_market_price_candidates.csv
 
 FIELDS = [
     "product_text", "original_product_text", "product_name_variants", "product_category", "product_subcategory",
-    "previous_product_category", "previous_product_subcategory", "merchant_name", "campaign_title", "campaign_type",
+    "previous_product_category", "previous_product_subcategory", "merchant_name", "merchant_resolution_method",
+    "merchant_evidence_text", "source_explicit_expired", "source_status_evidence_text", "campaign_title", "campaign_type",
     "promo_status", "valid_from", "valid_until", "period_precision",
     "period_flags", "matched_period_text", "period_evidence_text", "period_evidence_source", "period_certainty", "published_at",
     "promo_price", "normal_price", "normal_price_provenance", "reference_normal_price",
     "reference_price_source_name", "reference_price_merchant_name", "reference_price_match_scope",
     "reference_price_source_url", "reference_price_evidence_text", "reference_price_observed_at",
-    "reference_price_age_days", "reference_price_match_status", "reference_price_record_origin",
+    "reference_price_age_days", "reference_price_match_status", "reference_price_match_diagnostic", "reference_price_identity_match_method", "reference_price_record_origin",
     "reference_price_low", "reference_price_high", "reference_price_unit", "reference_price_note",
     "reference_primary_display_allowed",
     "market_reference_price", "market_reference_low", "market_reference_high",
@@ -282,6 +289,17 @@ def pipe_unique(values):
             if piece and piece not in result:
                 result.append(piece)
     return result
+
+
+def clean_name_variant_values(*values):
+    """Collect spelling variants after removing parser placeholders such as leading None."""
+    cleaned = []
+    for value in values:
+        for variant in name_variants(value):
+            normalized = clean_product_name(variant)
+            if normalized and normalized not in cleaned:
+                cleaned.append(normalized)
+    return cleaned
 
 
 def truthy(value):
@@ -498,11 +516,15 @@ def period_meta(row, title):
     return start, end, precision or "unknown", " | ".join(flags) or None, matched
 
 
-def current_status(start, end, precision, period_flags=None, source_status=None):
+def current_status(start, end, precision, period_flags=None, source_status=None, source_explicit_expired=False):
+    # An explicit source-side Expired/Kedaluwarsa label outranks dates inferred
+    # from a campaign title or broad catalogue context. Do not resurrect it.
+    if truthy(source_explicit_expired) or str(source_status or "").strip().casefold() == "expired":
+        return "expired"
     # A card with only an explicit "Sampai DD MMM YYYY" end date may still be
     # current, but it is an estimate because the starting date is not known.
     if not end:
-        return "expired" if source_status == "expired" else "unknown"
+        return "unknown"
     if not start:
         try:
             end_date = date.fromisoformat(end)
@@ -696,13 +718,22 @@ def load_source(path, source_label):
     for original in rows:
         raw = dict(original)
         title = (raw.get("campaign_title") or "").strip()
-        merchant, merchant_resolution_method = canonical_merchant(
-            raw.get("merchant_name") or raw.get("merchant"),
-            title,
-            raw.get("source_url") or raw.get("source_page_url") or raw.get("source_item_url"),
-            raw.get("source_urls"),
-            raw.get("source_campaign_titles"),
+        item_url = (raw.get("source_item_url") or "").strip()
+        hemat_item_merchant = (
+            infer_hemat_retailer_from_item_url(item_url)
+            if str(raw.get("source_name") or "").casefold() == "hemat.id" or "hemat.id" in str(raw.get("source_url") or "").casefold()
+            else None
         )
+        if hemat_item_merchant:
+            merchant, merchant_resolution_method = hemat_item_merchant, "hemat_item_url_prefix"
+        else:
+            merchant, merchant_resolution_method = canonical_merchant(
+                raw.get("merchant_name") or raw.get("merchant"),
+                title,
+                raw.get("source_url") or raw.get("source_page_url") or raw.get("source_item_url"),
+                raw.get("source_urls"),
+                raw.get("source_campaign_titles"),
+            )
         original_product = (raw.get("original_product_text") or raw.get("product_text") or "").strip()
         source_product = (raw.get("product_text") or "").strip()
         product = clean_product_name(source_product or original_product)
@@ -755,7 +786,8 @@ def load_source(path, source_label):
             raw, title, offer, raw_line, start, end, precision, period_flags_list, matched
         )
         period_flags = " | ".join(period_flags_list) or None
-        status = current_status(start, end, precision, period_flags, raw.get("promo_status"))
+        explicit_expired = truthy(raw.get("source_explicit_expired"))
+        status = current_status(start, end, precision, period_flags, raw.get("promo_status"), explicit_expired)
 
         # Calculate product-level discount from the SKU's offer text only.
         quality_flags = pipe_unique([raw.get("price_quality_flag") or ""])
@@ -873,12 +905,16 @@ def load_source(path, source_label):
         row = {
             "product_text": product,
             "original_product_text": original_product or None,
-            "product_name_variants": (raw.get("product_name_variants") or original_product or product or "").strip() or None,
+            "product_name_variants": product or clean_product_name(raw.get("product_name_variants") or "") or None,
             # Retain the last source-side category only for a reproducible audit sheet.
             # The public category columns are always recomputed by the current classifier.
             "previous_product_category": (raw.get("product_category") or raw.get("Kategori Produk") or "").strip() or None,
             "previous_product_subcategory": (raw.get("product_subcategory") or raw.get("Subkategori") or "").strip() or None,
             "merchant_name": merchant,
+            "merchant_resolution_method": "hemat_item_url_prefix" if hemat_item_merchant else (raw.get("merchant_resolution_method") or "").strip() or merchant_resolution_method,
+            "merchant_evidence_text": item_url if hemat_item_merchant else (raw.get("merchant_evidence_text") or "").strip() or None,
+            "source_explicit_expired": "true" if explicit_expired else "false",
+            "source_status_evidence_text": (raw.get("source_status_evidence_text") or "Expired/Kedaluwarsa pada konteks kartu sumber" if explicit_expired else "").strip() or None,
             "campaign_title": title,
             "campaign_type": canonical_campaign_type(raw.get("campaign_type"), title),
             "promo_status": status,
@@ -940,6 +976,9 @@ def load_source(path, source_label):
                 period_flags or "",
                 "missing_merchant_name" if not merchant else "",
                 "merchant_inferred_from_title_url" if merchant and merchant_resolution_method in {"title_url_known_alias", "known_alias_from_title_or_url", "source_url_known_alias", "campaign_title_inference"} else "",
+                "merchant_corrected_from_hemat_item_url" if hemat_item_merchant else "",
+                "source_explicit_expired" if explicit_expired else "",
+                "placeholder_product_token_removed" if re.match(r"(?i)^\s*(?:none|null|undefined|nan|n/?a)\b", original_product) else "",
                 "missing_product_text" if not product else "",
                 "missing_source_url" if not raw.get("source_url") else "",
                 "retained_from_previous_run" if truthy(raw.get("retained_from_previous_run")) else "",
@@ -1049,6 +1088,8 @@ def merge_rows(rows):
             str(row.get("valid_until") or ""),
             norm_key(row.get("purchase_condition")),
             norm_key(row.get("deal_type")),
+            norm_key(row.get("promo_status")),
+            str(bool(truthy(row.get("source_explicit_expired")))),
         )
         groups.setdefault(key, []).append(row)
 
@@ -1071,8 +1112,9 @@ def merge_rows(rows):
         best["product_review_reason"] = " | ".join(review_reasons) or None
         raw_name_variants = []
         for candidate in group:
-            raw_name_variants.extend(name_variants(candidate.get("product_name_variants")))
-            raw_name_variants.extend(name_variants(candidate.get("original_product_text")))
+            raw_name_variants.extend(clean_name_variant_values(
+                candidate.get("product_name_variants"), candidate.get("original_product_text")
+            ))
         raw_name_variants = list(OrderedDict.fromkeys(raw_name_variants))
         best["product_name_variants"] = " | ".join(raw_name_variants) or best.get("product_name_variants")
         if raw_name_variants:
@@ -1139,20 +1181,49 @@ def merge_rows(rows):
 
 
 def mark_overlapping_offers(rows):
-    """Jangan auto-merge beda periode; tandai untuk pemeriksaan manual."""
+    """Flag conflicting periods for the same offer; never choose the later date silently."""
     groups = defaultdict(list)
     for idx, row in enumerate(rows):
         key = (
             norm_key(row.get("merchant_name")), norm_key(row.get("product_text")),
             norm_key(row.get("offer_text")), str(row.get("promo_price") or ""),
             str(row.get("normal_price") or ""), norm_key(row.get("purchase_condition")),
-            norm_key(row.get("deal_type")),
+            norm_key(row.get("deal_type")), norm_key(row.get("campaign_title")),
         )
         groups[key].append(idx)
 
     for indices in groups.values():
         if len(indices) < 2:
             continue
+        signatures = {
+            (str(rows[idx].get("valid_from") or ""), str(rows[idx].get("valid_until") or ""))
+            for idx in indices
+        }
+        # If identical offers carry different estimated date windows, the system
+        # cannot know which end date is correct. Quarantine estimated windows;
+        # retain any exact range as the stronger evidence. If all are estimated,
+        # quarantine all conflicting rows.
+        if len(signatures) > 1:
+            exact_indices = [
+                idx for idx in indices
+                if rows[idx].get("period_precision") in {"range", "single_day"}
+                and rows[idx].get("valid_from") and rows[idx].get("valid_until")
+            ]
+            estimated_indices = [idx for idx in indices if idx not in exact_indices]
+            for idx in estimated_indices:
+                row = rows[idx]
+                if truthy(row.get("source_explicit_expired")) or str(row.get("promo_status") or "").casefold() == "expired":
+                    continue
+                row["promo_status"] = "unknown"
+                row["period_certainty"] = "unknown"
+                row["overlap_period_flag"] = "same_offer_conflicting_estimated_periods_keep_for_review"
+                row["period_flags"] = " | ".join(pipe_unique([
+                    row.get("period_flags") or "", "same_offer_conflicting_estimated_periods"
+                ]))
+                row["data_quality_flags"] = " | ".join(pipe_unique([
+                    row.get("data_quality_flags") or "", "same_offer_conflicting_estimated_periods"
+                ]))
+
         parsed = []
         for idx in indices:
             row = rows[idx]
@@ -1164,7 +1235,7 @@ def mark_overlapping_offers(rows):
         for idx, start, end in parsed:
             overlaps = [j for j, a, b in parsed if j != idx and start <= b and a <= end]
             rows[idx]["overlapping_offer_count"] = 1 + len(overlaps)
-            if overlaps:
+            if overlaps and not rows[idx].get("overlap_period_flag"):
                 rows[idx]["overlap_period_flag"] = "same_offer_overlapping_dates_keep_separate"
                 rows[idx]["data_quality_flags"] = " | ".join(pipe_unique([
                     rows[idx].get("data_quality_flags") or "",
@@ -1239,8 +1310,9 @@ def consolidate_overlapping_offers(rows):
             ))))
             all_name_variants = []
             for member in members:
-                all_name_variants.extend(name_variants(member.get("product_name_variants")))
-                all_name_variants.extend(name_variants(member.get("original_product_text")))
+                all_name_variants.extend(clean_name_variant_values(
+                    member.get("product_name_variants"), member.get("original_product_text")
+                ))
             all_name_variants = list(OrderedDict.fromkeys(all_name_variants))
             best["product_name_variants"] = " | ".join(all_name_variants) or best.get("product_name_variants")
             if all_name_variants:
@@ -1477,6 +1549,12 @@ def _equivalent_offer_rows(a, b):
     merchant_b = norm_key(b.get("merchant_name"))
     # Unknown merchant must not be silently assigned to a known retailer.
     if not merchant_a or not merchant_b or merchant_a != merchant_b:
+        return False
+    expired_a = truthy(a.get("source_explicit_expired")) or str(a.get("promo_status") or "").casefold() == "expired"
+    expired_b = truthy(b.get("source_explicit_expired")) or str(b.get("promo_status") or "").casefold() == "expired"
+    # Two expired observations may still be consolidated as historical evidence;
+    # never merge an expired observation into an active/upcoming one.
+    if expired_a != expired_b:
         return False
     if not product_names_can_auto_merge(a.get("product_text"), b.get("product_text")):
         return False
@@ -1739,8 +1817,9 @@ def merge_equivalent_cross_source_offers(rows):
             all_verification = []
             all_region_channels = []
             for member in cluster:
-                all_variants.extend(name_variants(member.get("product_name_variants")))
-                all_variants.extend(name_variants(member.get("original_product_text")))
+                all_variants.extend(clean_name_variant_values(
+                    member.get("product_name_variants"), member.get("original_product_text")
+                ))
                 all_urls.extend(pipe_unique([member.get("source_url") or "", member.get("source_urls") or "", member.get("source_page_url") or "", member.get("source_item_url") or ""]))
                 all_titles.extend(pipe_unique([member.get("campaign_title") or "", member.get("source_campaign_titles") or ""]))
                 all_names.extend(pipe_unique([member.get("source_name") or "", member.get("source_names") or ""]))
@@ -1827,6 +1906,7 @@ PERIOD_CONFLICT_MARKERS = (
     "title_lead_period_differs",
     "title_period_mismatch_with_catalog_dates",
     "source_dates_differ_from_title_period",
+    "same_offer_conflicting_estimated_periods",
 )
 
 
@@ -1920,7 +2000,10 @@ def recover_explicit_normal_price_from_offer(row):
     return True
 
 
-def apply_price_reference(rows, references, today=TODAY, max_age_days=PRICE_REFERENCE_MAX_AGE_DAYS):
+def apply_price_reference(
+    rows, references, today=TODAY, max_age_days=PRICE_REFERENCE_MAX_AGE_DAYS,
+    aliases=None, candidate_output_path=None,
+):
     """Attach source-backed historical prices; never use guessed/AI estimates.
 
     User-supplied and AI-generated estimate rows from legacy databases are ignored.
@@ -1941,7 +2024,17 @@ def apply_price_reference(rows, references, today=TODAY, max_age_days=PRICE_REFE
         "reference_matches_not_used_due_price_sanity": 0,
         "normal_prices_recovered_from_offer_text": 0,
         "discounts_calculated_from_recovered_source_prices": 0,
+        "match_diagnostic_counts": {},
+        "order_insensitive_exact_matches": 0,
+        "unit_normalized_exact_matches": 0,
+        "approved_manual_alias_matches": 0,
+        "manual_candidate_queries": 0,
+        "manual_candidate_rows": 0,
     }
+    match_diagnostics = Counter()
+    candidate_rows = []
+    candidate_query_keys = set()
+    candidate_index = prepare_reference_candidate_index(references) if candidate_output_path else None
     for row in rows:
         row.setdefault("reference_normal_price", None)
         row.setdefault("reference_price_source_name", None)
@@ -1952,6 +2045,8 @@ def apply_price_reference(rows, references, today=TODAY, max_age_days=PRICE_REFE
         row.setdefault("reference_price_observed_at", None)
         row.setdefault("reference_price_age_days", None)
         row.setdefault("reference_price_match_status", "not_checked")
+        row.setdefault("reference_price_match_diagnostic", None)
+        row.setdefault("reference_price_identity_match_method", None)
         row.setdefault("reference_price_record_origin", None)
         row.setdefault("reference_price_low", None)
         row.setdefault("reference_price_high", None)
@@ -1962,6 +2057,7 @@ def apply_price_reference(rows, references, today=TODAY, max_age_days=PRICE_REFE
         if as_int(row.get("normal_price")) is not None:
             row["normal_price_provenance"] = "current_offer_evidence"
             row["reference_price_match_status"] = "not_needed_current_normal_price_available"
+            row["reference_price_match_diagnostic"] = "current_normal_price_present"
             row["reference_primary_display_allowed"] = True
             if recovered_normal_price:
                 promo = as_int(row.get("promo_price"))
@@ -1989,14 +2085,39 @@ def apply_price_reference(rows, references, today=TODAY, max_age_days=PRICE_REFE
             continue
         if row.get("product_validation_status") != "eligible" or not row.get("merchant_name") or not row.get("product_text"):
             row["reference_price_match_status"] = "identity_not_eligible"
+            row["reference_price_match_diagnostic"] = "identity_not_eligible"
             continue
         summary["rows_checked"] += 1
         ref = find_reference_price(
             references, row.get("product_text"), row.get("merchant_name"), today,
             max_age_days=max_age_days, region_or_channel=row.get("region_or_channel"),
+            aliases=aliases,
         )
         row["reference_price_match_status"] = ref.get("status", "no_exact_match")
+        row["reference_price_match_diagnostic"] = ref.get("diagnostic") or ref.get("status", "no_exact_match")
+        row["reference_price_identity_match_method"] = ref.get("identity_match_method")
+        match_diagnostics[row["reference_price_match_diagnostic"]] += 1
+        match_method = ref.get("identity_match_method")
+        if match_method == "exact_tokens_reordered":
+            summary["order_insensitive_exact_matches"] += 1
+        elif match_method == "exact_unit_normalized":
+            summary["unit_normalized_exact_matches"] += 1
+        elif match_method == "approved_manual_alias":
+            summary["approved_manual_alias_matches"] += 1
         if ref.get("status") not in {"matched_recent_exact", "matched_recent_cross_merchant"}:
+            if (candidate_output_path and ref.get("status") == "no_exact_match"
+                    and row.get("product_validation_status") == "eligible"):
+                query_key = (
+                    clean_product_name(row.get("product_text")),
+                    merchant_key(row.get("merchant_name")),
+                    merchant_key(row.get("region_or_channel")),
+                )
+                if query_key not in candidate_query_keys:
+                    candidate_query_keys.add(query_key)
+                    candidate_rows.extend(suggest_reference_price_candidates(
+                        references, row.get("product_text"), row.get("merchant_name"),
+                        top_n=3, prepared_index=candidate_index,
+                    ))
             if ref.get("status") == "reference_too_old":
                 summary["stale_reference_not_used"] += 1
             elif ref.get("status") == "conflicting_prices_same_day":
@@ -2114,6 +2235,10 @@ def apply_price_reference(rows, references, today=TODAY, max_age_days=PRICE_REFE
         summary["reference_calculated_discounts"] += 1
     summary["reference_database_records"] = len(references)
     summary["max_age_days"] = max_age_days
+    summary["match_diagnostic_counts"] = dict(sorted(match_diagnostics.items()))
+    if candidate_output_path:
+        summary["manual_candidate_rows"] = write_price_match_candidates(candidate_rows, candidate_output_path)
+        summary["manual_candidate_queries"] = len(candidate_query_keys)
     return summary
 
 
@@ -2587,6 +2712,8 @@ CLEAN_COLUMNS = [
     ("Status Validasi Produk", "product_quality_label"),
     ("Verifikasi Sumber", "source_verification_label"),
     ("Status Referensi Harga", "reference_price_status_display"),
+    ("Diagnostik Referensi Harga", "reference_price_match_diagnostic"),
+    ("Metode Cocok SKU Referensi", "reference_price_identity_match_method"),
     ("Merchant Acuan Referensi", "reference_price_merchant_name"),
     ("Umur Referensi (hari)", "reference_price_age_days"),
     ("Tanggal Observasi Referensi", "reference_price_observed_at"),
@@ -2612,6 +2739,7 @@ CLEAN_COLUMNS = [
     ("Kampanye", "campaign_title"),
     ("Catatan", "display_notes"),
     ("Sumber URL", "source_url"),
+    ("Dasar Identifikasi Merchant", "merchant_resolution_method"),
 ]
 
 
@@ -2737,8 +2865,11 @@ def make_clean_row(row, review=False):
     if review:
         reasons = []
         if row.get("promo_status") == "active_estimated": reasons.append("Periode promo estimasi")
-        if has_material_period_conflict(row): reasons.append("Konflik tanggal judul/sumber")
-        elif "period_taken_from_lead" in str(row.get("period_flags") or ""): reasons.append("Tanggal diambil dari paragraf pembuka")
+        period_flag_text = str(row.get("period_flags") or "")
+        if "same_offer_conflicting_estimated_periods" in period_flag_text:
+            reasons.append("Tanggal penawaran yang sama saling bertentangan; perlu verifikasi manual")
+        elif has_material_period_conflict(row): reasons.append("Konflik tanggal judul/sumber")
+        elif "period_taken_from_lead" in period_flag_text: reasons.append("Tanggal diambil dari paragraf pembuka")
         if row.get("price_quality_flag"): reasons.append("Harga perlu diperiksa")
         if row.get("product_validation_status") == "review" and row.get("product_review_reason"):
             reasons.append("Identitas produk perlu diverifikasi: " + str(row.get("product_review_reason")))
@@ -3019,8 +3150,9 @@ def build_name_variant_rows(rows):
         merchant = group[0].get("merchant_name") or "Belum diketahui"
         variants = []
         for row in group:
-            variants.extend(name_variants(row.get("product_name_variants")))
-            variants.extend(name_variants(row.get("original_product_text")))
+            variants.extend(clean_name_variant_values(
+                row.get("product_name_variants"), row.get("original_product_text")
+            ))
         variants = list(OrderedDict.fromkeys(v for v in variants if v))
         # Ignore any values that are not spelling/pack notation variants of this canonical name.
         source_spellings = [v for v in variants if clean_product_name(v) == standard_name]
@@ -3539,9 +3671,11 @@ def build_simple_catalog_rows(rows):
     return [make_simple_excel_row(row) for row in rows]
 
 
-def write_simple_catalog_csv(path, rows):
+def write_simple_catalog_csv(path, rows, *, active_only=False):
     """Write a CSV whose columns and display values mirror the Excel Promo sheet."""
     simple_rows = build_simple_catalog_rows(rows)
+    if active_only:
+        simple_rows = [row for row in simple_rows if not row.get("_review_required")]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SIMPLE_EXCEL_COLUMNS, extrasaction="ignore")
@@ -3569,25 +3703,36 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
         for row in simple_current
     }
 
-    # The review tab includes explicit review rows plus current rows that still
-    # have an uncomputable/estimated discount or a data-quality flag.
-    combined_review = []
-    seen = set()
-    for row in simple_review + [item for item in simple_current if item.get("_review_required")]:
-        key = (
+    def simple_key(row):
+        return (
             str(row.get("Nama Produk", "")).casefold(),
             str(row.get("Merchant", "")).casefold(),
             str(row.get("Masa Berlaku", "")),
             str(row.get("Penawaran", "")),
             str(row.get("Sumber URL", "")),
         )
-        if key in seen:
-            continue
-        seen.add(key)
-        combined_review.append(row)
 
-    _write_simple_worksheet(wb, "Promo", simple_current, header_fill, title_fill)
-    _write_simple_worksheet(wb, "Perlu Diperiksa", combined_review, header_fill, title_fill)
+    active_keys = {simple_key(row) for row in simple_current}
+    active_review = [row for row in simple_current if row.get("_review_required")]
+    clean_current = [row for row in simple_current if not row.get("_review_required")]
+
+    # Keep the three everyday tabs mutually exclusive. Promo Aktif - Review is
+    # a separate bucket for offers that are currently active but still need a
+    # manual check; Perlu Diperiksa contains review-only rows outside the active
+    # catalog. This avoids counting the same offer twice across the main tabs.
+    review_only = []
+    seen_review = set()
+    for row in simple_review:
+        key = simple_key(row)
+        if key in active_keys or key in seen_review:
+            continue
+        seen_review.add(key)
+        review_only.append(row)
+    combined_review = active_review + review_only
+
+    _write_simple_worksheet(wb, "Promo", clean_current, header_fill, title_fill)
+    _write_simple_worksheet(wb, "Promo Aktif - Review", active_review, header_fill, title_fill)
+    _write_simple_worksheet(wb, "Perlu Diperiksa", review_only, header_fill, title_fill)
 
     # Separate market-price opportunities from official discount claims.
     market_rows = [
@@ -3736,7 +3881,11 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
     summary_rows = [
         ["KATALOG PROMO", ""],
         ["Tanggal referensi", today_text],
-        ["Promo pada daftar utama", len(simple_current)],
+        ["Promo aktif tanpa review tambahan", len(clean_current)],
+        ["Promo aktif yang perlu review", len(active_review)],
+        ["Total promo aktif", len(simple_current)],
+        ["Baris perlu diperiksa di luar promo aktif", len(review_only)],
+        ["Total baris review unik", len(combined_review)],
         ["Diskon bisa dihitung", len(numeric_discounts)],
         ["Diskon belum bisa dihitung", not_calculated],
         ["Estimasi bundling (bukan diskon terkonfirmasi)", estimated_bundles],
@@ -3745,9 +3894,8 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
         ["Promo di bawah median harga pasar", below_market_count],
         ["Pembanding hanya satu domain (belum kuat)", single_market_source_count],
         ["Kandidat harga belum terverifikasi", len(candidate_records)],
-        ["Baris perlu diperiksa", len(combined_review)],
         ["Kolom utama", "Nama Produk · Kategori · Merchant · Harga Normal/Acuan · Harga Promo · Hemat · Diskon · Masa Berlaku"],
-        ["Cara membaca", "Harga normal hanya diambil jika tercantum eksplisit pada teks sumber promo. Gambar poster dicatat sebagai referensi, tanpa membaca teks/gambar secara otomatis. Diskon dihitung dari harga normal dan promo yang cocok untuk SKU yang sama. Tab Peluang Harga membutuhkan minimal dua domain independen."],
+        ["Cara membaca", "Tab Promo hanya berisi promo aktif tanpa review tambahan. Promo aktif yang masih perlu diperiksa dipisahkan ke Promo Aktif - Review. Perlu Diperiksa berisi baris review di luar promo aktif, sehingga ketiga tab utama tidak saling menghitung ganda. Harga normal hanya diambil dari bukti teks; poster tidak dibaca dengan OCR."],
         ["Verifikasi", "Sumber agregator bukan verifikasi resmi retailer. Periksa sumber URL sebelum menganggap harga berlaku di semua toko/wilayah."],
         ["Riwayat", "Sheet audit teknis disimpan tersembunyi agar file utama sederhana. Data mentah dan log tetap ada di folder runtime."],
     ]
@@ -3768,7 +3916,10 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
 
     # Keep only useful daily tabs visible. Detailed audit sheets still exist for
     # project diagnostics and tests but do not clutter normal spreadsheet use.
-    visible = {"Ringkasan", "Promo", "Perlu Diperiksa", "Ringkasan Kategori", "Peluang Harga", "Kandidat Harga"}
+    visible = {
+        "Ringkasan", "Promo", "Promo Aktif - Review", "Perlu Diperiksa",
+        "Ringkasan Kategori", "Peluang Harga", "Kandidat Harga", "Referensi Dikarantina",
+    }
     for ws in wb.worksheets:
         ws.sheet_state = "visible" if ws.title in visible else "hidden"
     wb.active = wb.sheetnames.index("Promo")
@@ -3777,9 +3928,15 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
 
 
 
-def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_variant_rows, possible_duplicate_rows, rejected_rows=None, export_gate_report=None):
+def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_variant_rows, possible_duplicate_rows, rejected_rows=None, export_gate_report=None, quarantined_price_reference_rows=None):
     """User-facing workbook: clean catalogs plus separate review/duplicate/rejected audit sheets."""
     rejected_rows = rejected_rows or []
+    quarantined_price_reference_rows = quarantined_price_reference_rows or []
+    clean_active_rows, review_active_rows, review_nonactive_rows = partition_current_review_rows(
+        current_rows, review_rows
+    )
+    review_active_ids = {id(row) for row in review_active_rows}
+    clean_confirmed_rows = [row for row in confirmed_rows if id(row) not in review_active_ids]
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
@@ -3798,9 +3955,14 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
     summary = [
         ["KATALOG PROMO MULTI-SUMBER", ""],
         ["Tanggal acuan", TODAY.isoformat()],
-        ["Promo aktif (estimasi boleh)", len(current_rows)],
-        ["Promo aktif dengan periode pasti (bukan verifikasi retailer)", len(confirmed_rows)],
-        ["Baris perlu review", len(review_rows)],
+        ["Promo aktif tanpa review tambahan", len(clean_active_rows)],
+        ["Promo aktif yang perlu review", len(review_active_rows)],
+        ["Total promo aktif (dua baris di atas)", len(current_rows)],
+        ["Catatan pembagian sheet", "Promo dan Promo Aktif - Review saling eksklusif. Perlu Diperiksa hanya berisi baris review di luar promo aktif. Tab review aktif dipisah agar tidak dihitung dua kali sebagai total promo harian."],
+        ["Promo aktif dengan periode pasti dan tanpa review tambahan", len(clean_confirmed_rows)],
+        ["Baris review di luar promo aktif", len(review_nonactive_rows)],
+        ["Total baris review (termasuk promo aktif yang perlu review)", len(review_rows)],
+        ["Referensi harga dikarantina karena merchant tidak sesuai cakupan URL Hemat", len(quarantined_price_reference_rows)],
         ["Kandidat non-produk ditolak", len(rejected_rows)],
         ["Kelompok variasi nama produk", len(name_variant_rows)],
         ["Kandidat duplikat untuk diperiksa", len(possible_duplicate_rows)],
@@ -3916,9 +4078,10 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
     ws.sheet_view.showGridLines = False
 
     sheets = [
-        ("Aktif", current_rows, False),
-        ("Periode Pasti", confirmed_rows, False),
-        ("Perlu Review", review_rows, True),
+        ("Aktif", clean_active_rows, False),
+        ("Aktif - Review", review_active_rows, True),
+        ("Periode Pasti", clean_confirmed_rows, False),
+        ("Perlu Review", review_nonactive_rows, True),
     ]
     for sheet_name, rows, is_review in sheets:
         ws = wb.create_sheet(sheet_name)
@@ -4018,9 +4181,10 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
     ]
     ws.append(audit_headers)
     audit_sheets = [
-        ("Aktif", current_rows, False, False),
-        ("Periode Pasti", confirmed_rows, False, False),
-        ("Perlu Review", review_rows, True, False),
+        ("Aktif", clean_active_rows, False, False),
+        ("Aktif - Review", review_active_rows, True, False),
+        ("Periode Pasti", clean_confirmed_rows, False, False),
+        ("Perlu Review", review_nonactive_rows, True, False),
         ("Ditolak (Audit)", rejected_rows, False, True),
     ]
     for audit_sheet_name, audit_source_rows, is_review_sheet, is_rejected_sheet in audit_sheets:
@@ -4137,6 +4301,38 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
     for col in ("C", "D", "E"):
         for cell in ws[col][1:]:
             cell.number_format = '#,##0'
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    ws.sheet_view.showGridLines = False
+
+    # Suspicious legacy references are preserved for audit but excluded from
+    # matching. This makes the reason visible without silently deleting data.
+    ws = wb.create_sheet("Referensi Dikarantina")
+    quarantine_headers = [
+        "Merchant Acuan", "Nama Produk Referensi", "Harga Normal (Rp)",
+        "Tanggal Observasi", "Sumber", "URL Sumber", "Kampanye",
+        "Bukti Harga", "Alasan Karantina",
+    ]
+    ws.append(quarantine_headers)
+    for record in quarantined_price_reference_rows:
+        ws.append([
+            record.get("merchant_name"), record.get("product_text"),
+            _price_as_integer(record.get("normal_price")), record.get("observed_at"),
+            record.get("source_name"), record.get("source_url"),
+            record.get("campaign_title"), record.get("evidence_text"),
+            record.get("reference_diagnostic"),
+        ])
+    quarantine_widths = [22, 48, 18, 24, 22, 62, 54, 60, 42]
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="9C6500")
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for idx, width in enumerate(quarantine_widths, start=1):
+        ws.column_dimensions[get_column_letter(idx)].width = width
+        for col_cells in ws.iter_rows(min_row=2, min_col=idx, max_col=idx):
+            col_cells[0].alignment = Alignment(vertical="top", wrap_text=True)
+            if idx == 3:
+                col_cells[0].number_format = '#,##0'
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
     ws.sheet_view.showGridLines = False
@@ -4450,6 +4646,56 @@ def archive_legacy_price_estimates():
     return len(legacy)
 
 
+def _price_reference_quarantine_key(row):
+    return row.get("reference_key") or "|".join(
+        str(row.get(k) or "") for k in ("merchant_name", "product_text", "source_url", "observed_at")
+    )
+
+
+def load_price_reference_quarantine(path=OUT_PRICE_REFERENCE_QUARANTINE):
+    """Load the complete persistent quarantine, not only records found this run."""
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return [dict(row) for row in csv.DictReader(handle)]
+    except (OSError, csv.Error):
+        return []
+
+
+def write_price_reference_quarantine(rows, path=OUT_PRICE_REFERENCE_QUARANTINE):
+    """Append suspicious legacy references to an auditable quarantine CSV."""
+    if not rows:
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fields = list(dict.fromkeys([*REFERENCE_FIELDS, "reference_diagnostic"]))
+    existing = {_price_reference_quarantine_key(row): row for row in load_price_reference_quarantine(path)}
+    for row in rows:
+        existing[_price_reference_quarantine_key(row)] = dict(row)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(existing.values())
+    temp.replace(path)
+    return len(rows)
+
+
+def partition_current_review_rows(current_rows, review_rows):
+    """Split active offers and review rows into mutually exclusive buckets.
+
+    Rows share object identity between the export gate and review classifier.
+    Review rows accepted by the export gate are labelled active-but-needing-review;
+    other review rows stay outside the current active catalogue.
+    """
+    current_ids = {id(row) for row in current_rows}
+    review_active = [row for row in review_rows if id(row) in current_ids]
+    review_nonactive = [row for row in review_rows if id(row) not in current_ids]
+    review_active_ids = {id(row) for row in review_active}
+    active_clean = [row for row in current_rows if id(row) not in review_active_ids]
+    return active_clean, review_active, review_nonactive
+
+
 def main():
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -4477,12 +4723,21 @@ def main():
             archived_legacy_count = sum(1 for _ in csv.DictReader(handle))
     except (OSError, csv.Error):
         archived_legacy_count = 0
+    quarantined_price_reference_rows = []
+    # Inspect legacy rows before the database upsert removes invalid entries from
+    # the active matching set. The original evidence is copied to runtime audit.
+    load_reference_database(PRICE_REFERENCE_CSV, diagnostics=quarantined_price_reference_rows)
+    quarantined_reference_count = write_price_reference_quarantine(quarantined_price_reference_rows)
+    all_quarantined_price_reference_rows = load_price_reference_quarantine()
     price_reference_update = update_reference_database(PRICE_REFERENCE_CSV, all_loaded_rows, TODAY)
     all_price_reference_records = load_reference_database(PRICE_REFERENCE_CSV)
     price_reference_records = [r for r in all_price_reference_records if r.get("record_origin") != "user_supplied_estimate"]
     market_reference_init = initialize_market_reference_database(MARKET_REFERENCE_CSV)
     market_reference_records = load_market_reference_database(MARKET_REFERENCE_CSV)
     print("Observasi harga normal baru tersimpan:", price_reference_update.get("observations_added", 0))
+    print("Referensi lama baru dikarantina pada run ini:", quarantined_reference_count)
+    print("Total referensi dalam audit karantina:", len(all_quarantined_price_reference_rows))
+    print("Referensi baru ditolak karena konflik merchant/URL:", price_reference_update.get("rejected_merchant_scope_conflicts", 0))
     print("Referensi harga normal bersumber tersedia:", len(price_reference_records))
     print("Estimasi AI/rentang lama hanya di arsip audit:", archived_legacy_count)
     print("Estimasi AI/rentang yang dipakai aktif:", sum(1 for r in all_price_reference_records if r.get("record_origin") == "user_supplied_estimate"))
@@ -4495,9 +4750,17 @@ def main():
     merged_raw = mark_overlapping_offers(merged_raw)
     consolidated, consolidated_groups, consolidated_rows = consolidate_overlapping_offers(merged_raw)
     consolidated, equivalent_offer_groups, equivalent_offer_rows_absorbed = merge_equivalent_cross_source_offers(consolidated)
-    price_reference_apply_summary = apply_price_reference(consolidated, price_reference_records, today=TODAY)
-    market_price_apply_summary = compare_market_prices(consolidated, market_reference_records, today=TODAY)
-    estimated_normal_summary = estimate_normal_prices_from_references(consolidated, market_reference_records, today=TODAY)
+    product_name_aliases = load_product_name_aliases(PRODUCT_NAME_ALIASES_CSV)
+    price_reference_apply_summary = apply_price_reference(
+        consolidated, price_reference_records, today=TODAY, aliases=product_name_aliases,
+        candidate_output_path=OUT_PRICE_MATCH_CANDIDATES,
+    )
+    market_price_apply_summary = compare_market_prices(
+        consolidated, market_reference_records, today=TODAY, aliases=product_name_aliases
+    )
+    estimated_normal_summary = estimate_normal_prices_from_references(
+        consolidated, market_reference_records, today=TODAY, aliases=product_name_aliases
+    )
     print("Database harga pasar lokal:", MARKET_REFERENCE_CSV.relative_to(ROOT_DIR), f"({market_reference_init})")
     print("Estimasi harga normal pasar dari referensi manual:", estimated_normal_summary.get("rows_estimated", 0))
     print(" - Referensi Tokku manual:", estimated_normal_summary.get("tokku_estimates", 0))
@@ -4528,6 +4791,7 @@ def main():
         or r.get("price_quality_flag")
         or r.get("discount_percent_confidence") == "low"
     )]
+    active_clean_rows, active_review_rows, review_nonactive_rows = partition_current_review_rows(current, review)
 
     name_variant_rows = build_name_variant_rows(consolidated)
     possible_duplicate_rows = build_possible_duplicate_rows(current)
@@ -4537,8 +4801,11 @@ def main():
     write_audit_rows(OUT_FULL, merged_raw)
     write_audit_rows(OUT_REJECTED_PRODUCTS, rejected_product_rows)
     write_possible_duplicate_csv(OUT_POSSIBLE_DUPES, possible_duplicate_rows)
-    write_simple_catalog_csv(OUT_SIMPLE_CSV, current)
-    write_excel_catalog(OUT_XLSX, current, confirmed, review, name_variant_rows, possible_duplicate_rows, rejected_product_rows, export_gate_report)
+    write_simple_catalog_csv(OUT_SIMPLE_CSV, current, active_only=True)
+    write_excel_catalog(
+        OUT_XLSX, current, confirmed, review, name_variant_rows, possible_duplicate_rows,
+        rejected_product_rows, export_gate_report, all_quarantined_price_reference_rows,
+    )
 
     discount_basis = Counter(r.get("discount_percent_basis") or "not_available" for r in current)
     merchant_counts = Counter(r.get("merchant_name") or "UNKNOWN" for r in current)
@@ -4555,7 +4822,15 @@ def main():
             "path": PRICE_REFERENCE_CSV.relative_to(ROOT_DIR).as_posix(),
             "records_available_for_matching": len(price_reference_records),
             "max_match_age_days": PRICE_REFERENCE_MAX_AGE_DAYS,
-            "policy": "Exact normalized product + merchant + region/channel match. Historical normal-price references are not official retailer verification; stale, conflicting, or non-comparable references are not used to infer discounts.",
+            "policy": "Exact SKU match only: normalized text, reordered exact tokens, physically equivalent metric units with preserved multipack structure, or an explicitly approved manual alias. Fuzzy suggestions are written to a review-only CSV and never attach a price. Same merchant is preferred; cross-merchant fallback is labelled. Region/channel must match exactly.",
+            "approved_manual_alias_count": len(product_name_aliases),
+            "candidate_suggestions_path": OUT_PRICE_MATCH_CANDIDATES.relative_to(ROOT_DIR).as_posix(),
+        },
+        "price_reference_quarantine": {
+            "records_quarantined_this_run": quarantined_reference_count,
+            "records_quarantined_total": len(all_quarantined_price_reference_rows),
+            "audit_path": OUT_PRICE_REFERENCE_QUARANTINE.relative_to(ROOT_DIR).as_posix(),
+            "policy": "Hemat.id reference rows whose merchant is outside the retailer(s) explicitly named by the catalogue URL are excluded from matching and preserved in a persistent quarantine audit and workbook sheet.",
         },
         "price_reference_matching": price_reference_apply_summary,
         "input_row_count": len(all_loaded_rows),
@@ -4608,6 +4883,13 @@ def main():
         ),
         "confirmed_active_rows": len(confirmed),
         "review_rows": len(review),
+        "review_partition": {
+            "active_rows_without_extra_review": len(active_clean_rows),
+            "active_rows_needing_review": len(active_review_rows),
+            "review_rows_outside_active": len(review_nonactive_rows),
+            "review_rows_total_including_active_overlap": len(review),
+            "active_and_review_overlap_is_separate_bucket": True,
+        },
         "rows_with_product_discount": sum(r.get("discount_percent") is not None for r in current),
         "rows_with_price_calculated_discount": sum(r.get("discount_percent_calculated") is not None for r in current),
         "rows_with_reference_calculated_discount": sum(r.get("discount_percent_basis") == "calculated_from_price_reference" for r in current),
@@ -4637,10 +4919,10 @@ def main():
         "user_facing_output_files": [OUT_ACTIVE.relative_to(ROOT_DIR).as_posix(), OUT_SIMPLE_CSV.relative_to(ROOT_DIR).as_posix(), OUT_XLSX.relative_to(ROOT_DIR).as_posix()],
         "output_contracts": {
             OUT_ACTIVE.name: "Katalog bersih dengan kolom provenance lebih lengkap dan nilai numerik kosong bila tidak tersedia; cocok untuk pengolahan data.",
-            OUT_SIMPLE_CSV.name: "Kolom dan nilai tampilan identik dengan sheet Promo pada workbook Excel, termasuk label Belum bisa dihitung.",
+            OUT_SIMPLE_CSV.name: "Kolom dan nilai tampilan identik dengan sheet Promo pada workbook Excel; promo aktif yang masih perlu review terpisah di sheet Promo Aktif - Review.",
             OUT_XLSX.name: "Workbook ringkas untuk penggunaan harian serta sheet audit teknis tersembunyi.",
         },
-        "internal_audit_files": [OUT_CONFIRMED.relative_to(ROOT_DIR).as_posix(), OUT_REVIEW.relative_to(ROOT_DIR).as_posix(), OUT_FULL.relative_to(ROOT_DIR).as_posix(), OUT_REJECTED_PRODUCTS.relative_to(ROOT_DIR).as_posix(), OUT_GATE_REPORT.relative_to(ROOT_DIR).as_posix(), OUT_REPORT.relative_to(ROOT_DIR).as_posix()],
+        "internal_audit_files": [OUT_CONFIRMED.relative_to(ROOT_DIR).as_posix(), OUT_REVIEW.relative_to(ROOT_DIR).as_posix(), OUT_FULL.relative_to(ROOT_DIR).as_posix(), OUT_REJECTED_PRODUCTS.relative_to(ROOT_DIR).as_posix(), OUT_GATE_REPORT.relative_to(ROOT_DIR).as_posix(), OUT_PRICE_REFERENCE_QUARANTINE.relative_to(ROOT_DIR).as_posix(), OUT_PRICE_MATCH_CANDIDATES.relative_to(ROOT_DIR).as_posix(), OUT_REPORT.relative_to(ROOT_DIR).as_posix()],
         "clean_catalog_columns": [label for label, _ in CLEAN_COLUMNS],
         "full_audit_file": OUT_FULL.name,
         "discount_policy": {
@@ -4649,7 +4931,7 @@ def main():
             "price_based_percent": "calculated only when normal and promo prices are positive, unit-comparable, and price_basis is offer_price; Indonesian thousands separators are parsed safely",
             "period_confirmation": "Periode Pasti requires exact range/single_day plus visible text evidence and no unresolved material conflict; it is not retailer verification",
             "price_provenance": "Current offer prices need visible matching offer evidence. A missing normal price may be compared to a recent exact product + merchant reference, falling back to an exact other-merchant reference only when a recent same-merchant reference is unavailable. The reference price is displayed separately and is never represented as a current source price.",
-            "price_reference": f"Only explicit normal-price evidence is recorded from fresh, eligible source rows. Matching prefers exact normalized SKU/size/variant for the same merchant and region/channel; if no recent same-merchant reference exists, an exact fresh reference from another merchant may be used and is labelled as an estimate. Reference age <= {PRICE_REFERENCE_MAX_AGE_DAYS} days. Bundles/conditions, stale references, and fuzzy-only matches are not used for calculated discounts.",
+            "price_reference": f"Only explicit normal-price evidence is recorded from fresh, eligible source rows. Exact matching accepts normalized SKU, reordered exact tokens, equivalent metric units with unchanged pack structure, or manually approved aliases; fuzzy-only suggestions never attach a price. Same merchant and region/channel are preferred/required as configured. Reference age <= {PRICE_REFERENCE_MAX_AGE_DAYS} days. Bundles/conditions, stale references, and unapproved fuzzy matches are not used for calculated discounts.",
             "source_verification": "aggregator_only is distinct from retailer_verified; never imply official retailer verification",
             "buy_x_free_y": "separate low-confidence estimate assuming the free item has the same value; not a confirmed discount",
             "cross_sku_gift": "if named gift item differs from the SKU on the row, bundle estimate is cleared as product discount and row is routed to review",
@@ -4666,11 +4948,22 @@ def main():
     print("overlapping offer rows absorbed:", consolidated_rows)
     print("equivalent cross-source offer groups merged:", equivalent_offer_groups)
     print("equivalent cross-source offer rows absorbed:", equivalent_offer_rows_absorbed)
-    print("Promo periode aktif (termasuk periode estimasi):", len(current))
-    print("confirmed active:", len(confirmed))
-    print("review rows:", len(review))
+    print("Promo aktif/estimasi setelah konsolidasi dan gerbang kualitas:", len(current))
+    print("Promo aktif terkonfirmasi:", len(confirmed))
+    print("Promo aktif tanpa review tambahan:", len(active_clean_rows))
+    print("Promo aktif yang tetap perlu review:", len(active_review_rows))
+    print("Baris review di luar promo aktif:", len(review_nonactive_rows))
+    print("Baris review setelah konsolidasi (termasuk overlap aktif):", len(review))
     print("rows with product discount:", report["rows_with_product_discount"])
+    print("approved product-name aliases loaded:", len(product_name_aliases))
     print("recent price references matched:", price_reference_apply_summary["exact_recent_references_found"])
+    print("reference match diagnostics:", json.dumps(price_reference_apply_summary.get("match_diagnostic_counts", {}), ensure_ascii=False))
+    print("order-insensitive exact SKU matches:", price_reference_apply_summary.get("order_insensitive_exact_matches", 0))
+    print("unit-normalized exact SKU matches:", price_reference_apply_summary.get("unit_normalized_exact_matches", 0))
+    print("approved manual alias matches:", price_reference_apply_summary.get("approved_manual_alias_matches", 0))
+    print("manual SKU candidate suggestions:", price_reference_apply_summary.get("manual_candidate_rows", 0),
+          "rows across", price_reference_apply_summary.get("manual_candidate_queries", 0), "queries")
+    print("SKU candidate audit:", OUT_PRICE_MATCH_CANDIDATES.relative_to(ROOT_DIR))
     print("discounts calculated from references:", price_reference_apply_summary["reference_calculated_discounts"])
     print("market references attached:", market_price_apply_summary["rows_with_market_reference"])
     print("promos below market median:", market_price_apply_summary["below_market_median"])

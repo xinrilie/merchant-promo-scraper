@@ -97,3 +97,46 @@ def test_stale_market_references_are_not_used():
     summary = compare_market_prices([product], refs, today=date(2026, 10, 25), max_age_days=14)
     assert summary["no_market_reference"] == 1
     assert product["market_reference_status"] == "no_market_reference"
+
+
+def test_market_comparison_matches_equivalent_metric_units():
+    product = {
+        "product_text": "Sunlight Lime 910 ml",
+        "promo_price": 15000,
+        "product_validation_status": "eligible",
+    }
+    refs = [
+        _ref("Sunlight Lime 0.91 L", 18000, "shop-one.example"),
+        _ref("Sunlight Lime 910 ml", 20000, "shop-two.example"),
+    ]
+    summary = compare_market_prices([product], refs, today=date(2026, 10, 25))
+    assert summary["rows_with_market_reference"] == 1
+    assert product["market_reference_price"] == 19000
+    assert product["market_reference_source_count"] == 2
+
+
+def test_normal_estimate_matches_equivalent_metric_units():
+    from promo_market_prices import estimate_normal_prices_from_references
+
+    product = {
+        "product_text": "Susu UHT Full Cream 1800 ml",
+        "merchant_name": "Indomaret",
+        "promo_price": 30000,
+        "normal_price": None,
+        "reference_normal_price": None,
+        "product_validation_status": "eligible",
+    }
+    refs = [
+        _ref("Susu UHT Full Cream 1.8 L", 34000, "store-one.example"),
+        _ref("Susu UHT Full Cream 1800 ml", 36000, "store-two.example"),
+    ]
+    for index, ref in enumerate(refs):
+        ref["price_kind"] = "regular"
+        ref["retailer_name"] = f"Retailer {index + 1}"
+        ref["source_checked_at"] = "2026-10-24"
+    summary = estimate_normal_prices_from_references(
+        [product], refs, today=date(2026, 10, 25)
+    )
+    assert summary["rows_estimated"] == 1
+    assert product["estimated_normal_price"] == 35000
+    assert product["estimated_normal_observation_count"] == 2

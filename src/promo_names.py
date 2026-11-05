@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import csv
 import re
 from difflib import SequenceMatcher
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
 
 def _clean_space(value: object) -> str:
@@ -10,7 +12,14 @@ def _clean_space(value: object) -> str:
 
 
 def _amount(value: str) -> str:
-    value = value.replace(",", ".")
+    raw = str(value).strip()
+    # Indonesian product labels sometimes write a thousand-unit quantity as
+    # "1.000 ml". Treat a single separator followed by exactly three digits as
+    # a thousands separator; ordinary decimal sizes such as 1,5 L stay decimal.
+    if re.fullmatch(r"[1-9]\d{0,2}[.,]\d{3}", raw):
+        value = raw.replace(".", "").replace(",", "")
+    else:
+        value = raw.replace(",", ".")
     try:
         d = Decimal(value)
         if d == d.to_integral_value():
@@ -55,6 +64,13 @@ def clean_product_name(value: object) -> str:
     so the actual product size is not lost. Different sizes remain different SKUs.
     """
     text = _clean_space(value)
+    if not text:
+        return ""
+
+    # Some catalogue parsers stringify a missing brand as a literal placeholder.
+    # Remove only leading standalone placeholders; preserve legitimate words later
+    # in the product description and keep the raw label in audit fields.
+    text = re.sub(r"^(?:(?:none|null|undefined|nan|n/?a)\b[\s,:|/\-]*)+", "", text, flags=re.IGNORECASE).strip()
     if not text:
         return ""
 
@@ -273,6 +289,127 @@ def product_names_can_auto_merge(a: object, b: object, threshold: float = 0.93) 
         return False
     token_coverage = len(set(left_tokens) & set(right_tokens)) / max(1, min(len(set(left_tokens)), len(set(right_tokens))))
     return product_name_similarity(a, b) >= threshold and token_coverage >= 0.80
+
+
+# Product matching uses canonical physical quantities without changing display names.
+# Multipack structure is deliberately preserved: 2 x 500 ml is not treated as 1 L.
+_MATCH_PACK_RE = re.compile(
+    r"\b(\d+)\s*x\s*(\d+(?:[.,]\d+)?)\s*"
+    r"(ml|milli\s*liter|gr?\.?|grams?|kg|kilograms?|litre|liter|ltr|l|"
+    r"pcs?|pieces|buah|bags?|sheets?|lembar|rolls?|sachets?|tabs?|tablets?|capsules?)\b",
+    re.IGNORECASE,
+)
+_MATCH_SINGLE_RE = re.compile(
+    r"\b(\d+(?:[.,]\d+)?)\s*"
+    r"(ml|milli\s*liter|gr?\.?|grams?|kg|kilograms?|litre|liter|ltr|l|"
+    r"pcs?|pieces|buah|bags?|sheets?|lembar|rolls?|sachets?|tabs?|tablets?|capsules?)\b",
+    re.IGNORECASE,
+)
+
+
+def _canonical_measure(amount: str, unit: str) -> str:
+    value = Decimal(amount.replace(",", "."))
+    raw_unit = re.sub(r"\s+", "", unit.casefold()).rstrip(".")
+    aliases = {
+        "gr": "g", "gram": "g", "grams": "g", "g": "g",
+        "kg": "kg", "kilogram": "kg", "kilograms": "kg",
+        "liter": "l", "litre": "l", "ltr": "l", "l": "l",
+        "milliliter": "ml", "millilitre": "ml", "ml": "ml",
+        "pc": "pcs", "pcs": "pcs", "piece": "pcs", "pieces": "pcs", "buah": "pcs",
+        "bag": "bags", "bags": "bags",
+        "sheet": "sheets", "sheets": "sheets", "lembar": "sheets",
+        "roll": "rolls", "rolls": "rolls",
+        "sachet": "sachets", "sachets": "sachets",
+        "tab": "tablets", "tabs": "tablets", "tablet": "tablets", "tablets": "tablets",
+        "capsule": "capsules", "capsules": "capsules",
+    }
+    normalized = aliases.get(raw_unit, raw_unit)
+    if normalized == "kg":
+        value *= 1000
+        normalized = "g"
+    elif normalized == "l":
+        value *= 1000
+        normalized = "ml"
+    return f"{format(value.normalize(), 'f')}:{normalized}"
+
+
+def product_name_package_match_signature(value: object) -> tuple[str, ...]:
+    """Canonical size/pack signature used only for exact SKU matching.
+
+    Compatible units are normalized (1.8 L == 1800 ml; 1 kg == 1000 g), but
+    multipack counts and dimensions are retained to avoid equating different SKUs.
+    """
+    text = clean_product_name(value).casefold()
+    pack = _MATCH_PACK_RE.search(text)
+    if pack:
+        count, amount, unit = pack.groups()
+        return (f"pack:{int(count)}x{_canonical_measure(amount, unit)}",)
+    signatures = []
+    for amount, unit in _MATCH_SINGLE_RE.findall(text):
+        signature = f"single:{_canonical_measure(amount, unit)}"
+        if signature not in signatures:
+            signatures.append(signature)
+    return tuple(sorted(signatures))
+
+
+def product_name_matching_key(value: object, aliases: dict[str, str] | None = None) -> str:
+    """Order-insensitive exact identity key with unit-normalized package data.
+
+    This remains an exact matcher: all non-size tokens, including brand, flavour,
+    model, formula and variant, must be present with the same multiplicity.
+    An optional alias map is only for explicitly approved, manually curated aliases.
+    """
+    text = clean_product_name(value).casefold()
+    if not text:
+        return ""
+    pack = _MATCH_PACK_RE.search(text)
+    if pack:
+        body = _MATCH_PACK_RE.sub(" ", text, count=1)
+    else:
+        body = _MATCH_SINGLE_RE.sub(" ", text)
+    tokens = re.findall(r"[a-z0-9]+", body)
+    body_key = " ".join(sorted(tokens))
+    package = "|".join(product_name_package_match_signature(value)) or "no-explicit-size"
+    key = f"{body_key}||{package}"
+    return (aliases or {}).get(key, key)
+
+
+def load_product_name_aliases(path: str | Path) -> dict[str, str]:
+    """Load only explicitly approved aliases with identical package signatures.
+
+    The CSV is intentionally empty by default. Adding an alias is a manual data
+    curation action; aliases with different sizes or variant markers are ignored.
+    """
+    alias_path = Path(path)
+    if not alias_path.is_file():
+        return {}
+    try:
+        with alias_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return {}
+    proposed: dict[str, set[str]] = {}
+    raw_values: dict[str, tuple[str, str]] = {}
+    approved_values = {"1", "true", "yes", "approved", "setuju"}
+    for row in rows:
+        if str(row.get("approved") or "").strip().casefold() not in approved_values:
+            continue
+        alias = _clean_space(row.get("alias"))
+        canonical = _clean_space(row.get("canonical_name"))
+        alias_key = product_name_matching_key(alias)
+        canonical_key = product_name_matching_key(canonical)
+        if not alias_key or not canonical_key or alias_key == canonical_key:
+            continue
+        if product_name_package_match_signature(alias) != product_name_package_match_signature(canonical):
+            continue
+        if product_name_variant_signature(alias) != product_name_variant_signature(canonical):
+            continue
+        proposed.setdefault(alias_key, set()).add(canonical_key)
+        raw_values[alias_key] = (alias, canonical)
+    # Conflicting aliases are intentionally not applied.
+    return {key: next(iter(values)) for key, values in proposed.items() if len(values) == 1}
+
+
 
 def _self_test() -> None:
     samples = {

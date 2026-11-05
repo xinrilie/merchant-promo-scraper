@@ -426,3 +426,134 @@ def test_excel_shows_unverified_search_leads_in_separate_candidate_sheet(tmp_pat
         assert sheet.sheet_state == "visible"
     finally:
         workbook.close()
+
+
+def test_price_reference_allows_exact_same_tokens_in_different_word_order():
+    ref = _reference_dict(
+        product_text="Full Cream Susu UHT 1 L",
+        source_url="https://example.test/full-cream-susu-uht",
+    )
+    match = find_reference_price(
+        [ref], "Susu UHT Full Cream 1 Liter", "Indomaret", TODAY
+    )
+    assert match["status"] == "matched_recent_exact"
+    assert match["normal_price"] == 20000
+    assert match["identity_match_method"] == "exact_tokens_reordered"
+
+
+def test_price_reference_reports_size_variant_and_channel_mismatches():
+    base = _reference_dict()
+    size_mismatch = find_reference_price(
+        [_reference_dict(product_text="Susu UHT Full Cream 250 ml")],
+        "Susu UHT Full Cream 1 L", "Indomaret", TODAY,
+    )
+    assert size_mismatch["diagnostic"] == "product_size_mismatch"
+
+    variant_mismatch = find_reference_price(
+        [_reference_dict(product_text="Susu UHT Chocolate 1 L")],
+        "Susu UHT Vanilla 1 L", "Indomaret", TODAY,
+    )
+    assert variant_mismatch["diagnostic"] == "product_variant_mismatch"
+
+    channel_mismatch = find_reference_price(
+        [_reference_dict(region_or_channel="online")],
+        "Susu UHT Full Cream 1 L", "Indomaret", TODAY,
+        region_or_channel="offline",
+    )
+    assert channel_mismatch["diagnostic"] == "region_or_channel_mismatch"
+
+
+def test_apply_price_reference_exposes_diagnostic_when_reference_identity_does_not_match():
+    refs = [_reference_dict(product_text="Susu UHT Full Cream 250 ml")]
+    row = _promo_without_normal(product_text="Susu UHT Full Cream 1 L")
+    summary = enhancer.apply_price_reference([row], refs, today=TODAY)
+    assert row["reference_normal_price"] is None
+    assert row["reference_price_match_diagnostic"] == "product_size_mismatch"
+    assert summary["match_diagnostic_counts"]["product_size_mismatch"] == 1
+
+
+def test_exact_reference_with_missing_or_future_observation_date_is_diagnosed():
+    missing = _reference_dict(observed_at="")
+    match = find_reference_price([missing], "Susu UHT Full Cream 1 L", "Indomaret", TODAY)
+    assert match["status"] == "no_exact_match"
+    assert match["diagnostic"] == "reference_timestamp_missing_or_future"
+
+    future = _reference_dict(observed_at="2026-12-01T10:00:00+07:00")
+    match = find_reference_price([future], "Susu UHT Full Cream 1 L", "Indomaret", TODAY)
+    assert match["status"] == "no_exact_match"
+    assert match["diagnostic"] == "reference_timestamp_missing_or_future"
+
+
+def test_price_reference_matches_equivalent_metric_units_but_preserves_pack_structure():
+    refs = [_reference_dict(product_text="Susu UHT Full Cream 1.8 L")]
+    match = find_reference_price(refs, "Susu UHT Full Cream 1800 ml", "Indomaret", TODAY)
+    assert match["status"] == "matched_recent_exact"
+    assert match["identity_match_method"] == "exact_unit_normalized"
+    assert match["normal_price"] == 20000
+
+    pack_ref = [_reference_dict(product_text="Susu UHT 2 x 500 ml")]
+    equivalent_pack = find_reference_price(pack_ref, "Susu UHT 2 x 0.5 L", "Indomaret", TODAY)
+    assert equivalent_pack["status"] == "matched_recent_exact"
+    assert equivalent_pack["identity_match_method"] == "exact_unit_normalized"
+    different_pack = find_reference_price(pack_ref, "Susu UHT 1 L", "Indomaret", TODAY)
+    assert different_pack["status"] == "no_exact_match"
+
+
+def test_manual_product_alias_must_be_approved_and_keep_size_and_variant(tmp_path):
+    from promo_names import load_product_name_aliases
+
+    path = tmp_path / "aliases.csv"
+    path.write_text(
+        "alias,canonical_name,approved,note\n"
+        "Sari Wangi Teh Celup 25 bags,SariWangi Teh Celup 25 bags,true,Brand spelling checked\n"
+        "Sari Wangi Teh Celup 50 bags,SariWangi Teh Celup 25 bags,true,Wrong size\n"
+        "Sari Wangi Teh Celup 25 bags,SariWangi Teh Celup 25 bags,false,Not approved\n",
+        encoding="utf-8-sig",
+    )
+    aliases = load_product_name_aliases(path)
+    assert len(aliases) == 1
+    refs = [_reference_dict(product_text="SariWangi Teh Celup 25 bags")]
+    match = find_reference_price(
+        refs, "Sari Wangi Teh Celup 25 bags", "Indomaret", TODAY, aliases=aliases
+    )
+    assert match["status"] == "matched_recent_exact"
+    assert match["identity_match_method"] == "approved_manual_alias"
+
+
+def test_fuzzy_reference_candidates_are_review_only_and_never_attach_price(tmp_path):
+    from promo_price_reference import suggest_reference_price_candidates
+
+    refs = [
+        _reference_dict(product_text="Susu UHT Full Cream 1 L"),
+        _reference_dict(product_text="Susu UHT Cokelat 1 L", normal_price="21000", source_url="https://example.test/chocolate"),
+    ]
+    suggestions = suggest_reference_price_candidates(
+        refs, "Susu UHT Full Cream Fresh 1 L", "Indomaret", top_n=3
+    )
+    assert suggestions
+    from promo_names import product_name_matching_key
+    assert product_name_matching_key(suggestions[0]["candidate_product"]) == product_name_matching_key("Susu UHT Full Cream 1 L")
+    assert suggestions[0]["automatic_match_allowed"] == "no"
+
+    output_path = tmp_path / "runtime" / "price_reference_match_candidates.csv"
+    row = _promo_without_normal(product_text="Susu UHT Full Cream Fresh 1 L")
+    summary = enhancer.apply_price_reference(
+        [row], refs, today=TODAY, candidate_output_path=output_path
+    )
+    assert row["reference_normal_price"] is None
+    assert row["reference_price_match_status"] == "no_exact_match"
+    assert summary["manual_candidate_rows"] > 0
+    assert output_path.is_file()
+    with output_path.open(encoding="utf-8-sig", newline="") as handle:
+        saved = list(csv.DictReader(handle))
+    assert saved and all(item["automatic_match_allowed"] == "no" for item in saved)
+
+
+def test_apply_price_reference_uses_unit_normalized_exact_sku_for_reference_discount():
+    reference = _reference_dict(product_text="Susu UHT Full Cream 1.8 L")
+    row = _promo_without_normal(product_text="Susu UHT Full Cream 1800 ml")
+    summary = enhancer.apply_price_reference([row], [reference], today=TODAY)
+    assert row["reference_normal_price"] == 20000
+    assert row["discount_percent"] == 25.0
+    assert row["reference_price_identity_match_method"] == "exact_unit_normalized"
+    assert summary["unit_normalized_exact_matches"] == 1

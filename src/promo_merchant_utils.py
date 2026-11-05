@@ -40,6 +40,106 @@ def clean_text(value: object) -> str:
     return SPACE_RE.sub(" ", str(value or "")).strip()
 
 
+
+# Retailer prefixes embedded in Hemat product/category detail slugs.
+# These item-level URLs are stronger evidence than the comparison-page URL.
+_HEMAT_RETAILER_SLUGS = (
+    ("Super Indo", ("superindo", "super-indo")),
+    ("Alfamart", ("alfamart",)),
+    ("Alfamidi", ("alfamidi",)),
+    ("Indomaret", ("indomaret",)),
+    ("Hypermart", ("hypermart",)),
+    ("Yogya", ("yogya", "yomart")),
+    ("Tip Top", ("tip-top", "tiptop")),
+    ("Lotte Mart", ("lottemart", "lotte-mart")),
+    ("Transmart", ("transmart",)),
+    ("AEON", ("aeon",)),
+    ("Courts", ("courts",)),
+    ("Hari Hari Swalayan", ("hari-hari", "harihari", "hari-hari-swalayan")),
+)
+
+
+def _retailer_slug_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean_text(value).casefold())
+
+
+def canonical_hemat_retailer(value: object) -> str | None:
+    """Canonicalize a retailer label only when it matches a known Hemat alias."""
+    key = _retailer_slug_key(value)
+    if not key:
+        return None
+    for canonical, aliases in _HEMAT_RETAILER_SLUGS:
+        if key == _retailer_slug_key(canonical) or any(key == _retailer_slug_key(alias) for alias in aliases):
+            return canonical
+    return None
+
+
+def hemat_retailer_scope_from_url(url: object) -> set[str] | None:
+    """Return retailers explicitly represented by a Hemat catalogue URL.
+
+    Examples:
+      /katalog-alfamart/ -> {"Alfamart"}
+      /katalog-alfamart,courts/promo-promo/ -> {"Alfamart", "Courts"}
+
+    Product detail URLs such as /katalog/biore.../ and unrelated URLs return
+    None because they do not define a catalogue retailer scope.
+    """
+    parsed = urlparse(clean_text(url))
+    if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").casefold() not in {"hemat.id", "www.hemat.id"}:
+        return None
+    for part in (segment for segment in (parsed.path or "").split("/") if segment):
+        match = re.fullmatch(r"katalog-([^/]+)", part, flags=re.I)
+        if not match:
+            continue
+        slug = match.group(1)
+        retailers = set()
+        for token in slug.split(","):
+            token = token.strip()
+            canonical = canonical_hemat_retailer(token)
+            if canonical:
+                retailers.add(canonical)
+        return retailers or None
+    return None
+
+
+def hemat_merchant_scope_issue(merchant: object, url: object) -> str | None:
+    """Flag a merchant outside the retailer(s) named by its Hemat catalogue URL.
+
+    This is a conservative guardrail: it never guesses which retailer supplied
+    an offer when the URL lists multiple retailers. It only rejects a clearly
+    impossible attribution, e.g. merchant AEON on an Alfamart-vs-Courts page.
+    """
+    scope = hemat_retailer_scope_from_url(url)
+    if scope is None:
+        return None
+    canonical = canonical_hemat_retailer(merchant)
+    if canonical is None:
+        return "merchant_not_recognized_in_hemat_catalogue_scope"
+    if canonical not in scope:
+        return "merchant_not_in_hemat_catalogue_scope"
+    return None
+
+def infer_hemat_retailer_from_item_url(url: object) -> str | None:
+    """Return a retailer only when a Hemat item-detail slug explicitly starts with it.
+
+    Comparison/listing URLs are intentionally rejected. Example:
+    ``/katalog/alfamart.popok-dewasa-celana/`` -> ``Alfamart``.
+    Generic category slugs such as ``/katalog/buah-mangga/`` return ``None``.
+    """
+    parsed = urlparse(clean_text(url))
+    if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").casefold() not in {"hemat.id", "www.hemat.id"}:
+        return None
+    parts = [part for part in (parsed.path or "").split("/") if part]
+    for idx, part in enumerate(parts[:-1]):
+        if part.casefold() not in {"katalog", "harga"}:
+            continue
+        slug = parts[idx + 1].casefold()
+        for canonical, aliases in _HEMAT_RETAILER_SLUGS:
+            for alias in aliases:
+                if slug == alias or any(slug.startswith(alias + separator) for separator in (".", "-", "_")):
+                    return canonical
+    return None
+
 def infer_merchant_candidate_from_title(title: object) -> str | None:
     """Extract a short candidate from a title with an explicit campaign prefix.
 

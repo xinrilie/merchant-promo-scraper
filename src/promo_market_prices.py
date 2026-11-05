@@ -13,7 +13,10 @@ from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
-from promo_names import clean_product_name, product_name_size_signature, product_name_variant_signature
+from promo_names import (
+    clean_product_name, product_name_size_signature, product_name_variant_signature,
+    product_name_matching_key, product_name_package_match_signature,
+)
 from promo_price_reference import identity_key
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -206,6 +209,7 @@ def estimate_normal_prices_from_references(
     references: list[dict],
     today: date | None = None,
     max_age_days: int = DEFAULT_NORMAL_ESTIMATE_MAX_AGE_DAYS,
+    aliases: dict[str, str] | None = None,
 ) -> dict:
     """Attach a clearly labelled normal-market estimate from exact manual evidence.
 
@@ -237,7 +241,9 @@ def estimate_normal_prices_from_references(
                 continue
         item["_estimate_checked_date"] = checked
         item["_estimate_age_days"] = (today - checked).days
-        by_product.setdefault(item.get("product_key", ""), []).append(item)
+        match_key = product_name_matching_key(item.get("product_text"), aliases)
+        if match_key:
+            by_product.setdefault(match_key, []).append(item)
 
     summary = {
         "rows_checked": 0, "rows_estimated": 0, "tokku_estimates": 0,
@@ -261,19 +267,19 @@ def estimate_normal_prices_from_references(
         if row.get("product_validation_status") != "eligible":
             continue
         product = clean_product_name(row.get("product_text"))
-        pkey = identity_key(product)
+        pkey = product_name_matching_key(product, aliases)
         if not pkey:
             continue
         summary["rows_checked"] += 1
-        qsize = "|".join(product_name_size_signature(product))
+        qpackage = product_name_package_match_signature(product)
         qvariant = "|".join(sorted(product_name_variant_signature(product)))
         candidates = [
             item for item in by_product.get(pkey, [])
-            if item.get("size_signature", "") == qsize
+            if product_name_package_match_signature(item.get("product_text")) == qpackage
             and item.get("variant_signature", "") == qvariant
         ]
         if not candidates:
-            if any(item.get("product_key") == pkey for item in references):
+            if any(product_name_matching_key(item.get("product_text"), aliases) == pkey for item in references):
                 summary["stale_or_unmatched"] += 1
             continue
 
@@ -338,7 +344,10 @@ def estimate_normal_prices_from_references(
     return summary
 
 
-def compare_market_prices(rows: list[dict], references: list[dict], today: date | None = None, max_age_days: int = DEFAULT_MAX_AGE_DAYS) -> dict:
+def compare_market_prices(
+    rows: list[dict], references: list[dict], today: date | None = None,
+    max_age_days: int = DEFAULT_MAX_AGE_DAYS, aliases: dict[str, str] | None = None,
+) -> dict:
     """Attach market median only when same exact product/size/variant evidence matches."""
     today = today or date.today()
     by_product: dict[str, list[dict]] = {}
@@ -354,7 +363,9 @@ def compare_market_prices(rows: list[dict], references: list[dict], today: date 
             continue
         if not observed or observed > today or (today - observed).days > max_age_days or price is None:
             continue
-        by_product.setdefault(row.get("product_key", ""), []).append(row)
+        match_key = product_name_matching_key(row.get("product_text"), aliases)
+        if match_key:
+            by_product.setdefault(match_key, []).append(row)
 
     summary = {"rows_checked": 0, "rows_with_market_reference": 0, "single_source_only": 0, "below_market_median": 0, "not_below_market_median": 0, "no_market_reference": 0, "stale_or_unmatched": 0, "max_age_days": max_age_days}
     for row in rows:
@@ -367,14 +378,18 @@ def compare_market_prices(rows: list[dict], references: list[dict], today: date 
             row.setdefault(key, None)
         promo = parse_idr_price(row.get("promo_price"))
         product = clean_product_name(row.get("product_text"))
-        pkey = identity_key(product)
+        pkey = product_name_matching_key(product, aliases)
         if not pkey or promo is None or row.get("product_validation_status") != "eligible":
             row["market_reference_status"] = "not_comparable"
             continue
         summary["rows_checked"] += 1
-        qsize = "|".join(product_name_size_signature(product))
+        qpackage = product_name_package_match_signature(product)
         qvariant = "|".join(sorted(product_name_variant_signature(product)))
-        candidates = [item for item in by_product.get(pkey, []) if item.get("size_signature", "") == qsize and item.get("variant_signature", "") == qvariant]
+        candidates = [
+            item for item in by_product.get(pkey, [])
+            if product_name_package_match_signature(item.get("product_text")) == qpackage
+            and item.get("variant_signature", "") == qvariant
+        ]
         latest_by_domain: dict[str, dict] = {}
         for item in sorted(candidates, key=lambda r: (r.get("observed_at", ""), r.get("source_url", ""))):
             domain = str(item.get("source_domain") or "").lower().removeprefix("www.")
@@ -384,7 +399,7 @@ def compare_market_prices(rows: list[dict], references: list[dict], today: date 
         if not refs:
             row["market_reference_status"] = "no_market_reference"
             summary["no_market_reference"] += 1
-            if any(item.get("product_key") == pkey for item in references):
+            if any(product_name_matching_key(item.get("product_text"), aliases) == pkey for item in references):
                 summary["stale_or_unmatched"] += 1
             continue
         prices = [parse_idr_price(item.get("market_price")) for item in refs]
