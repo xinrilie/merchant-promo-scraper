@@ -1,20 +1,41 @@
+"""Grouped regression tests. Cases are organized by functional area."""
+
+
+
 from __future__ import annotations
 
 import csv
+
 import sys
+
 from datetime import date
+
 from pathlib import Path
 
-ENGINE_DIR = Path(__file__).resolve().parents[1] / "src"
-ROOT_DIR = ENGINE_DIR.parent
-sys.path.insert(0, str(ENGINE_DIR))
-
 import enrich_existing_promo_catalog_multisource as enhancer
+
 from promo_price_reference import REFERENCE_FIELDS, find_reference_price, load_reference_database, update_reference_database
 
+from enrich_existing_promo_catalog_multisource import (  # noqa: E402
+    load_price_reference_quarantine,
+    write_price_reference_quarantine,
+)
+
+
+
+# --- from test_price_reference.py ---
+ENGINE_DIR = Path(__file__).resolve().parents[1] / "src"
+
+# --- from test_price_reference.py ---
+ROOT_DIR = ENGINE_DIR.parent
+
+# --- from test_price_reference.py ---
+sys.path.insert(0, str(ENGINE_DIR))
+
+# --- from test_price_reference.py ---
 TODAY = date(2026, 10, 24)
 
-
+# --- from test_price_reference.py ---
 def _normal_observation(**overrides):
     row = {
         "merchant_name": "Indomaret",
@@ -39,7 +60,7 @@ def _normal_observation(**overrides):
     row.update(overrides)
     return row
 
-
+# --- from test_price_reference.py ---
 def _promo_without_normal(**overrides):
     row = {
         "product_text": "Susu UHT Full Cream 1 L",
@@ -94,7 +115,7 @@ def _promo_without_normal(**overrides):
     row.update(overrides)
     return row
 
-
+# --- from test_price_reference.py ---
 def _write_reference(path: Path, rows: list[dict]):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
@@ -102,7 +123,7 @@ def _write_reference(path: Path, rows: list[dict]):
         writer.writeheader()
         writer.writerows(rows)
 
-
+# --- from test_price_reference.py ---
 def _reference_dict(**overrides):
     row = {
         "merchant_name": "Indomaret",
@@ -119,7 +140,7 @@ def _reference_dict(**overrides):
     row.update(overrides)
     return row
 
-
+# --- from test_price_reference.py ---
 def test_explicit_fresh_normal_price_is_saved_to_reference_database(tmp_path):
     path = tmp_path / "data" / "product_price_reference.csv"
     summary = update_reference_database(path, [_normal_observation()], TODAY)
@@ -131,7 +152,7 @@ def test_explicit_fresh_normal_price_is_saved_to_reference_database(tmp_path):
     assert records[0]["normal_price"] == "20000"
     assert records[0]["record_origin"] == "observed_scrape"
 
-
+# --- from test_price_reference.py ---
 def test_database_update_is_idempotent_for_same_page_product_and_day(tmp_path):
     path = tmp_path / "data" / "product_price_reference.csv"
     update_reference_database(path, [_normal_observation()], TODAY)
@@ -139,7 +160,7 @@ def test_database_update_is_idempotent_for_same_page_product_and_day(tmp_path):
     assert summary["observations_added"] == 0
     assert len(load_reference_database(path)) == 1
 
-
+# --- from test_price_reference.py ---
 def test_database_does_not_learn_missing_stale_retained_or_unverified_prices(tmp_path):
     path = tmp_path / "data" / "product_price_reference.csv"
     rows = [
@@ -153,7 +174,7 @@ def test_database_does_not_learn_missing_stale_retained_or_unverified_prices(tmp
     assert summary["observations_added"] == 0
     assert len(load_reference_database(path)) == 0
 
-
+# --- from test_price_reference.py ---
 def test_price_reference_finds_only_exact_merchant_product_size_and_variant(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [_reference_dict()])
@@ -169,8 +190,7 @@ def test_price_reference_finds_only_exact_merchant_product_size_and_variant(tmp_
     assert find_reference_price(refs, "Susu UHT Full Cream 250 ml", "Indomaret", TODAY)["status"] == "no_exact_match"
     assert find_reference_price(refs, "Susu UHT Chocolate 1 L", "Indomaret", TODAY)["status"] == "no_exact_match"
 
-
-
+# --- from test_price_reference.py ---
 def test_newer_normal_price_replaces_previous_price_for_same_product_merchant(tmp_path):
     path = tmp_path / "data" / "product_price_reference.csv"
     first = _normal_observation(normal_price=20000, normal_price_evidence_text="Harga Normal Rp20.000", scraped_at="2026-10-22T10:00:00+07:00")
@@ -183,8 +203,7 @@ def test_newer_normal_price_replaces_previous_price_for_same_product_merchant(tm
     assert records[0]["source_name"] == "Scanharga.com"
     assert summary["observations_updated"] == 1
 
-
-
+# --- from test_price_reference.py ---
 def test_same_merchant_reference_takes_priority_over_newer_other_merchant():
     refs = [
         _reference_dict(merchant_name="Indomaret", normal_price="20000", observed_at="2026-10-23T10:00:00+07:00"),
@@ -196,6 +215,7 @@ def test_same_merchant_reference_takes_priority_over_newer_other_merchant():
     assert match["merchant_name"] == "Indomaret"
     assert match["normal_price"] == 20000
 
+# --- from test_price_reference.py ---
 def test_missing_same_merchant_price_falls_back_to_latest_other_merchant(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [_reference_dict(merchant_name="Indomaret", normal_price="20000")])
@@ -214,6 +234,7 @@ def test_missing_same_merchant_price_falls_back_to_latest_other_merchant(tmp_pat
     assert clean["Merchant Acuan Referensi"] == "Indomaret"
     assert "merchant lain" in clean["Dasar Diskon"].casefold()
 
+# --- from test_price_reference.py ---
 def test_missing_current_normal_price_calculates_discount_from_recent_reference(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [_reference_dict()])
@@ -237,7 +258,7 @@ def test_missing_current_normal_price_calculates_discount_from_recent_reference(
     assert clean["Diskon (%)"] == 25.0
     assert "referensi harga historis" in clean["Dasar Diskon"].casefold()
 
-
+# --- from test_price_reference.py ---
 def test_price_reference_calculation_passes_gate_only_with_source_and_evidence(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [_reference_dict()])
@@ -250,7 +271,7 @@ def test_price_reference_calculation_passes_gate_only_with_source_and_evidence(t
     issues = enhancer.export_quality_gate_issues(invalid)
     assert "reference_discount_without_valid_reference" in issues
 
-
+# --- from test_price_reference.py ---
 def test_missing_normal_price_is_recovered_from_explicit_offer_text_and_discount_calculated():
     row = _promo_without_normal(
         offer_text="Harga Promo Rp15.000 dari harga normalnya Rp20.000",
@@ -266,7 +287,7 @@ def test_missing_normal_price_is_recovered_from_explicit_offer_text_and_discount
     assert summary["normal_prices_recovered_from_offer_text"] == 1
     assert summary["discounts_calculated_from_recovered_source_prices"] == 1
 
-
+# --- from test_price_reference.py ---
 def test_explicit_normal_price_recovery_is_blocked_for_bundle_offer():
     row = _promo_without_normal(
         offer_text="Beli 3 lebih hemat Rp11.200 dari harga normal Rp12.600",
@@ -278,7 +299,7 @@ def test_explicit_normal_price_recovery_is_blocked_for_bundle_offer():
     assert row["normal_price"] is None
     assert row["discount_percent"] is None
 
-
+# --- from test_price_reference.py ---
 def test_expired_reference_is_not_used_to_infer_discount(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [_reference_dict(observed_at="2026-08-01T10:00:00+07:00")])
@@ -289,7 +310,7 @@ def test_expired_reference_is_not_used_to_infer_discount(tmp_path):
     assert row["reference_price_match_status"] == "reference_too_old"
     assert summary["stale_reference_not_used"] == 1
 
-
+# --- from test_price_reference.py ---
 def test_conflicting_same_day_reference_prices_are_not_used(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [
@@ -303,7 +324,7 @@ def test_conflicting_same_day_reference_prices_are_not_used(tmp_path):
     assert row["reference_price_match_status"] == "conflicting_prices_same_day"
     assert summary["ambiguous_reference_not_used"] == 1
 
-
+# --- from test_price_reference.py ---
 def test_bundles_and_conditional_offers_do_not_get_historical_sku_discount(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [_reference_dict()])
@@ -320,7 +341,7 @@ def test_bundles_and_conditional_offers_do_not_get_historical_sku_discount(tmp_p
         assert row["discount_percent_basis"] == "not_available"
         assert row["reference_price_match_status"] == expected_status
 
-
+# --- from test_price_reference.py ---
 def test_reference_db_persists_manual_verified_official_prices(tmp_path):
     path = tmp_path / "data" / "product_price_reference.csv"
     _write_reference(path, [_reference_dict(
@@ -338,7 +359,7 @@ def test_reference_db_persists_manual_verified_official_prices(tmp_path):
     assert match["record_origin"] == "manual_verified"
     assert match["verification_status"] == "retailer_official"
 
-
+# --- from test_price_reference.py ---
 def test_manual_reference_wins_over_aggregator_price_when_same_day(tmp_path):
     path = tmp_path / "reference.csv"
     _write_reference(path, [
@@ -350,7 +371,7 @@ def test_manual_reference_wins_over_aggregator_price_when_same_day(tmp_path):
     assert match["normal_price"] == 22000
     assert match["record_origin"] == "manual_verified"
 
-
+# --- from test_price_reference.py ---
 def test_excel_exports_reference_database_and_clearly_labels_reference_discount(tmp_path, monkeypatch):
     from openpyxl import load_workbook
 
@@ -385,7 +406,7 @@ def test_excel_exports_reference_database_and_clearly_labels_reference_discount(
     finally:
         workbook.close()
 
-
+# --- from test_price_reference.py ---
 def test_excel_shows_unverified_search_leads_in_separate_candidate_sheet(tmp_path, monkeypatch):
     import csv
     from openpyxl import load_workbook
@@ -427,7 +448,7 @@ def test_excel_shows_unverified_search_leads_in_separate_candidate_sheet(tmp_pat
     finally:
         workbook.close()
 
-
+# --- from test_price_reference.py ---
 def test_price_reference_allows_exact_same_tokens_in_different_word_order():
     ref = _reference_dict(
         product_text="Full Cream Susu UHT 1 L",
@@ -440,7 +461,7 @@ def test_price_reference_allows_exact_same_tokens_in_different_word_order():
     assert match["normal_price"] == 20000
     assert match["identity_match_method"] == "exact_tokens_reordered"
 
-
+# --- from test_price_reference.py ---
 def test_price_reference_reports_size_variant_and_channel_mismatches():
     base = _reference_dict()
     size_mismatch = find_reference_price(
@@ -462,7 +483,7 @@ def test_price_reference_reports_size_variant_and_channel_mismatches():
     )
     assert channel_mismatch["diagnostic"] == "region_or_channel_mismatch"
 
-
+# --- from test_price_reference.py ---
 def test_apply_price_reference_exposes_diagnostic_when_reference_identity_does_not_match():
     refs = [_reference_dict(product_text="Susu UHT Full Cream 250 ml")]
     row = _promo_without_normal(product_text="Susu UHT Full Cream 1 L")
@@ -471,7 +492,7 @@ def test_apply_price_reference_exposes_diagnostic_when_reference_identity_does_n
     assert row["reference_price_match_diagnostic"] == "product_size_mismatch"
     assert summary["match_diagnostic_counts"]["product_size_mismatch"] == 1
 
-
+# --- from test_price_reference.py ---
 def test_exact_reference_with_missing_or_future_observation_date_is_diagnosed():
     missing = _reference_dict(observed_at="")
     match = find_reference_price([missing], "Susu UHT Full Cream 1 L", "Indomaret", TODAY)
@@ -483,7 +504,7 @@ def test_exact_reference_with_missing_or_future_observation_date_is_diagnosed():
     assert match["status"] == "no_exact_match"
     assert match["diagnostic"] == "reference_timestamp_missing_or_future"
 
-
+# --- from test_price_reference.py ---
 def test_price_reference_matches_equivalent_metric_units_but_preserves_pack_structure():
     refs = [_reference_dict(product_text="Susu UHT Full Cream 1.8 L")]
     match = find_reference_price(refs, "Susu UHT Full Cream 1800 ml", "Indomaret", TODAY)
@@ -498,7 +519,7 @@ def test_price_reference_matches_equivalent_metric_units_but_preserves_pack_stru
     different_pack = find_reference_price(pack_ref, "Susu UHT 1 L", "Indomaret", TODAY)
     assert different_pack["status"] == "no_exact_match"
 
-
+# --- from test_price_reference.py ---
 def test_manual_product_alias_must_be_approved_and_keep_size_and_variant(tmp_path):
     from promo_names import load_product_name_aliases
 
@@ -519,7 +540,7 @@ def test_manual_product_alias_must_be_approved_and_keep_size_and_variant(tmp_pat
     assert match["status"] == "matched_recent_exact"
     assert match["identity_match_method"] == "approved_manual_alias"
 
-
+# --- from test_price_reference.py ---
 def test_fuzzy_reference_candidates_are_review_only_and_never_attach_price(tmp_path):
     from promo_price_reference import suggest_reference_price_candidates
 
@@ -548,7 +569,7 @@ def test_fuzzy_reference_candidates_are_review_only_and_never_attach_price(tmp_p
         saved = list(csv.DictReader(handle))
     assert saved and all(item["automatic_match_allowed"] == "no" for item in saved)
 
-
+# --- from test_price_reference.py ---
 def test_apply_price_reference_uses_unit_normalized_exact_sku_for_reference_discount():
     reference = _reference_dict(product_text="Susu UHT Full Cream 1.8 L")
     row = _promo_without_normal(product_text="Susu UHT Full Cream 1800 ml")
@@ -558,7 +579,7 @@ def test_apply_price_reference_uses_unit_normalized_exact_sku_for_reference_disc
     assert row["reference_price_identity_match_method"] == "exact_unit_normalized"
     assert summary["unit_normalized_exact_matches"] == 1
 
-
+# --- from test_price_reference.py ---
 def test_prepared_reference_index_returns_same_exact_match_as_direct_lookup():
     from promo_price_reference import prepare_reference_lookup_index
 
@@ -586,7 +607,7 @@ def test_prepared_reference_index_returns_same_exact_match_as_direct_lookup():
     assert prepared["status"] == "matched_recent_exact"
     assert prepared["normal_price"] == 21000
 
-
+# --- from test_price_reference.py ---
 def test_prepared_reference_candidate_index_keeps_fuzzy_suggestions_review_only():
     from promo_price_reference import prepare_reference_candidate_index, suggest_reference_price_candidates
 
@@ -613,3 +634,88 @@ def test_prepared_reference_candidate_index_keeps_fuzzy_suggestions_review_only(
     )
     assert prepared == fallback
     assert all(row["automatic_match_allowed"] == "no" for row in prepared)
+
+# --- from test_price_reference_quarantine.py ---
+SRC = Path(__file__).resolve().parents[1] / "src"
+
+# --- from test_price_reference_quarantine.py ---
+sys.path.insert(0, str(SRC))
+
+# --- from test_price_reference_quarantine.py ---
+def test_quarantine_records_persist_when_later_run_has_no_new_conflicts(tmp_path):
+    path = tmp_path / "runtime" / "price_reference_quarantine.csv"
+    record = {
+        "reference_key": "sku-1|aeon|hemat",
+        "merchant_name": "AEON",
+        "product_text": "Sania Minyak Goreng 2 L",
+        "normal_price": "43900",
+        "source_name": "Hemat.id",
+        "source_url": "https://www.hemat.id/katalog-alfamart,courts/",
+        "reference_diagnostic": "merchant_not_in_hemat_catalogue_scope",
+    }
+
+    assert write_price_reference_quarantine([record], path=path) == 1
+    assert write_price_reference_quarantine([], path=path) == 0
+
+    loaded = load_price_reference_quarantine(path)
+    assert len(loaded) == 1
+    assert loaded[0]["merchant_name"] == "AEON"
+    assert loaded[0]["reference_diagnostic"] == "merchant_not_in_hemat_catalogue_scope"
+
+# --- from test_price_reference_quarantine.py ---
+def test_quarantine_upsert_deduplicates_same_reference_key(tmp_path):
+    path = tmp_path / "runtime" / "price_reference_quarantine.csv"
+    first = {
+        "reference_key": "sku-1|aeon|hemat",
+        "merchant_name": "AEON",
+        "product_text": "Sania Minyak Goreng 2 L",
+        "source_url": "https://www.hemat.id/katalog-alfamart,courts/",
+        "reference_diagnostic": "merchant_not_in_hemat_catalogue_scope",
+    }
+    corrected = {**first, "reference_diagnostic": "reviewed_not_restored"}
+
+    write_price_reference_quarantine([first], path=path)
+    write_price_reference_quarantine([corrected], path=path)
+
+    loaded = load_price_reference_quarantine(path)
+    assert len(loaded) == 1
+    assert loaded[0]["reference_diagnostic"] == "reviewed_not_restored"
+
+# --- from test_price_reference_quarantine.py ---
+def test_workbook_exposes_quarantine_sheet_and_keeps_its_records_visible(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+    import enrich_existing_promo_catalog_multisource as enhancer
+
+    monkeypatch.setattr(enhancer, "PRICE_REFERENCE_CSV", tmp_path / "state" / "price_reference.csv")
+    monkeypatch.setattr(enhancer, "MARKET_REFERENCE_CSV", tmp_path / "state" / "market_reference.csv")
+    monkeypatch.setattr(enhancer, "CATEGORY_REVIEW_LIST_CSV", tmp_path / "config" / "not-present.csv")
+
+    record = {
+        "reference_key": "sku-1|aeon|hemat",
+        "merchant_name": "AEON",
+        "product_text": "Sania Minyak Goreng 2 L",
+        "normal_price": "43900",
+        "observed_at": "2026-11-03T10:00:00+07:00",
+        "source_name": "Hemat.id",
+        "source_url": "https://www.hemat.id/katalog-alfamart,courts/",
+        "reference_diagnostic": "merchant_not_in_hemat_catalogue_scope",
+    }
+    workbook_path = tmp_path / "output" / "catalog.xlsx"
+    workbook_path.parent.mkdir(parents=True, exist_ok=True)
+    assert enhancer.write_excel_catalog(
+        workbook_path, [], [], [], [], [], [], {"status": "passed", "issue_counts": {}}, [record]
+    )
+
+    workbook = load_workbook(workbook_path, read_only=True, data_only=True)
+    try:
+        assert "Referensi Dikarantina" in workbook.sheetnames
+        sheet = workbook["Referensi Dikarantina"]
+        assert sheet.sheet_state == "visible"
+        rows = list(sheet.iter_rows(values_only=True))
+        assert len(rows) == 2
+        assert rows[1][0] == "AEON"
+        assert rows[1][-1] == "merchant_not_in_hemat_catalogue_scope"
+        for title in ("Promo", "Promo Aktif - Review", "Perlu Diperiksa"):
+            assert title in workbook.sheetnames
+    finally:
+        workbook.close()

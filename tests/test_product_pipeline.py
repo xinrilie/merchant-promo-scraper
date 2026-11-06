@@ -1,19 +1,34 @@
+"""Grouped regression tests. Cases are organized by functional area."""
+
+
+
 from __future__ import annotations
 
 import csv
+
 import sys
+
 import tempfile
+
 from pathlib import Path
 
-ENGINE_DIR = Path(__file__).resolve().parents[1] / "src"
-sys.path.insert(0, str(ENGINE_DIR))
-
 import promo_multisource_collector as collector
+
 import enrich_existing_promo_catalog_multisource as enhancer
+
 from promo_names import product_names_can_auto_merge
+
 from promo_product_validation import product_candidate_rejection_reason, product_candidate_review_reason
 
 
+
+# --- from test_pipeline.py ---
+ENGINE_DIR = Path(__file__).resolve().parents[1] / "src"
+
+# --- from test_pipeline.py ---
+sys.path.insert(0, str(ENGINE_DIR))
+
+# --- from test_pipeline.py ---
 def test_article_headlines_are_not_products():
     cases = [
         "Apa Benefit yang Didapatkan Promo Paris Baguette BNI Wonderful Weekend",
@@ -55,7 +70,7 @@ def test_article_headlines_are_not_products():
                 "long_editorial_sentence_misparsed_as_product",
             }, (name, title, reason)
 
-
+# --- from test_pipeline.py ---
 def test_uniqlo_cta_fragment_with_price_is_rejected_as_editorial_not_product():
     row = {
         "product_text": "Jangan Sampai Kelewatan Promo Uniqlo Limited Offers Mulai",
@@ -72,8 +87,7 @@ def test_uniqlo_cta_fragment_with_price_is_rejected_as_editorial_not_product():
     reason = product_candidate_rejection_reason(row, "Katalogpromosi.com article")
     assert reason == "editorial_heading_misparsed_as_product", (row["product_text"], reason)
 
-
-
+# --- from test_pipeline.py ---
 def test_editorial_teaser_rejected_even_with_structured_bundle_offer():
     # Exact leak shown in the user's workbook screenshot. The product-looking row
     # inherited a generic B1G1 / 50% offer from an Alfamidi promo card.
@@ -128,8 +142,7 @@ def test_editorial_teaser_rejected_even_with_structured_bundle_offer():
     }
     assert product_candidate_rejection_reason(valid_product, "hemat_card") is None
 
-
-
+# --- from test_pipeline.py ---
 def test_real_products_stay_eligible():
     samples = [
         {
@@ -165,7 +178,7 @@ def test_real_products_stay_eligible():
         reason = product_candidate_rejection_reason(row, row.get("source_name"))
         assert reason is None, (row["product_text"], reason)
 
-
+# --- from test_pipeline.py ---
 def test_discount_only_short_fragments_need_product_identity():
     bad_rows = [
         {"product_text": "Akhirnya", "offer_text": "Diskon 50%", "normal_price": None, "promo_price": None},
@@ -190,7 +203,7 @@ def test_discount_only_short_fragments_need_product_identity():
     }
     assert product_candidate_rejection_reason(named_item, "promo_multisource_products_all.csv") is None
 
-
+# --- from test_pipeline.py ---
 def test_enhancer_rejects_stale_false_rows_without_campaign_title():
     # Reproduce the exact failure mode in the screenshot: old rows have product
     # fragments and a discount claim, but the campaign_title field is empty.
@@ -229,8 +242,7 @@ def test_enhancer_rejects_stale_false_rows_without_campaign_title():
             (r.get("product_text"), r.get("product_validation_status"), r.get("product_rejection_reason")) for r in rows
         ]
 
-
-
+# --- from test_pipeline.py ---
 def test_article_paragraphs_and_campaign_titles_are_rejected_even_with_prices():
     cases = [
         {
@@ -278,7 +290,7 @@ def test_article_paragraphs_and_campaign_titles_are_rejected_even_with_prices():
         reason = product_candidate_rejection_reason(row, source_mode="article")
         assert reason, f"Editorial/noisy candidate passed validation: {row['product_text']}"
 
-
+# --- from test_pipeline.py ---
 def test_pwp_explanatory_fragments_are_rejected_even_with_prices():
     """Protect against editorial snippets leaking as priced PWP products."""
     cases = [
@@ -327,13 +339,13 @@ def test_pwp_explanatory_fragments_are_rejected_even_with_prices():
             for r in loaded
         ]
 
-
+# --- from test_pipeline.py ---
 def test_name_fuzzy_guardrails():
     assert product_names_can_auto_merge("Aice Mochi Vanilla Chocolate 270g", "Aice Mochi Vanilla / Chocolate 270 g")
     assert not product_names_can_auto_merge("Aice Mochi Vanilla 270 g", "Aice Mochi Chocolate 270 g")
     assert not product_names_can_auto_merge("Sunlight Jeruk 755 ml", "Sunlight Jeruk 450 ml")
 
-
+# --- from test_pipeline.py ---
 def test_collector_article_extraction_regression():
     collector.REJECTED_PRODUCT_CANDIDATES.clear()
     html = '''<article><div class="entry-content">
@@ -359,7 +371,7 @@ def test_collector_article_extraction_regression():
     assert rows[0]["promo_price"] == 12900
     assert len(collector.REJECTED_PRODUCT_CANDIDATES) == 7, [r.get("product_text") for r in collector.REJECTED_PRODUCT_CANDIDATES]
 
-
+# --- from test_pipeline.py ---
 def test_enhancer_defense_in_depth():
     # The enhancer must independently reject rows from old CSVs or stale collector data.
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -392,8 +404,7 @@ def test_enhancer_defense_in_depth():
         assert len(loaded) == 7
         assert all(row.get("product_validation_status") == "rejected" for row in loaded)
 
-
-
+# --- from test_pipeline.py ---
 def test_cross_source_fuzzy_merge_and_guardrails():
     # Integration-level regression: fuzzy matching runs in the enhancer after
     # rows from multiple sources are loaded and product eligibility is checked.
@@ -493,10 +504,7 @@ def test_cross_source_fuzzy_merge_and_guardrails():
         assert len(same_name_aice) == 2
         assert {str(r.get("promo_price")) for r in same_name_aice} == {"9900", "11500"}
 
-
-
-
-
+# --- from test_pipeline.py ---
 def test_multisource_month_periods_are_estimates_and_rank_current_titles_first():
     canonical_months = {
         1: "januari", 2: "februari", 3: "maret", 4: "april", 5: "mei", 6: "juni",
@@ -518,40 +526,7 @@ def test_multisource_month_periods_are_estimates_and_rank_current_titles_first()
     assert end_only["valid_until"] == "2099-12-31"
     assert end_only["promo_status"] == "active_estimated"
 
-
-
-
-def main():
-    test_article_headlines_are_not_products()
-    test_editorial_teaser_rejected_even_with_structured_bundle_offer()
-    test_real_products_stay_eligible()
-    test_discount_only_short_fragments_need_product_identity()
-    test_article_paragraphs_and_campaign_titles_are_rejected_even_with_prices()
-    test_pwp_explanatory_fragments_are_rejected_even_with_prices()
-    test_enhancer_rejects_stale_false_rows_without_campaign_title()
-    test_name_fuzzy_guardrails()
-    test_collector_article_extraction_regression()
-    test_enhancer_defense_in_depth()
-    test_cross_source_fuzzy_merge_and_guardrails()
-    test_multisource_month_periods_are_estimates_and_rank_current_titles_first()
-    print("REGRESSION TESTS PASSED")
-    print("- editorial/headline fragments from the screenshot are rejected")
-    print("- conversational promo teaser is rejected even when a card has a B1G1/50% offer")
-    print("- valid SKU price and bundle examples are kept")
-    print("- fuzzy name matching preserves size/flavour distinctions")
-    print("- collector filters screenshot editorial false positives before writing scrape output")
-    print("- article paragraphs and campaign headings are rejected even when a price was extracted")
-    print("- PWP explanatory sentence fragments are rejected even when they inherit a price")
-    print("- enhancer independently filters stale/old false product rows even when campaign_title is missing")
-    print("- fuzzy merge combines corroborated cross-source offers but preserves variant/price conflicts")
-    print("- multi-source article selection prioritizes current period evidence; month-only periods remain estimates")
-
-
-if __name__ == "__main__":
-    main()
-
-
-
+# --- from test_pipeline.py ---
 def test_screenshot_campaign_headline_never_passes_as_a_product():
     row = {
         "product_text": (
@@ -567,7 +542,7 @@ def test_screenshot_campaign_headline_never_passes_as_a_product():
     reason = product_candidate_rejection_reason(row, "Katalogpromosi.com article")
     assert reason == "editorial_heading_misparsed_as_product"
 
-
+# --- from test_pipeline.py ---
 def test_standalone_minimum_purchase_threshold_is_not_a_product_or_price():
     for name in ["Min. Belanja", "Minimum Pembelanjaan", "Minimum Transaksi", "Minimal Pembelian"]:
         row = {
@@ -580,7 +555,7 @@ def test_standalone_minimum_purchase_threshold_is_not_a_product_or_price():
         }
         assert product_candidate_rejection_reason(row, "Scanharga.com article") == "purchase_condition_misparsed_as_product"
 
-
+# --- from test_pipeline.py ---
 def test_payment_benefit_amount_on_short_name_is_review_not_product_price():
     row = {
         "product_text": "Extra",
@@ -596,7 +571,7 @@ def test_payment_benefit_amount_on_short_name_is_review_not_product_price():
     assert product_candidate_rejection_reason(row, "Scanharga.com article") is None
     assert product_candidate_review_reason(row, "Scanharga.com article") == "short_name_with_payment_offer_needs_review"
 
-
+# --- from test_pipeline.py ---
 def test_truncated_tissue_name_is_recovered_from_original_label():
     fields = [
         "product_text", "original_product_text", "offer_text", "promo_price", "normal_price",
@@ -632,8 +607,7 @@ def test_truncated_tissue_name_is_recovered_from_original_label():
     assert row["product_category"] == "Tisu & Produk Kertas", row["product_category"]
     assert row["product_validation_status"] != "review", row["product_review_reason"]
 
-
-
+# --- from test_pipeline.py ---
 def test_payment_benefit_amount_is_not_exported_as_product_price():
     fields = [
         "product_text", "original_product_text", "offer_text", "promo_price", "normal_price",

@@ -1,16 +1,30 @@
+"""Grouped regression tests. Cases are organized by functional area."""
+
+
+
 from __future__ import annotations
 
 import sys
+
 from pathlib import Path
 
-ENGINE_DIR = Path(__file__).resolve().parents[1] / "src"
-sys.path.insert(0, str(ENGINE_DIR))
-
 import promo_categories
+
 import promo_multisource_collector as collector
+
 import enrich_existing_promo_catalog_multisource as enhancer
 
+from promo_product_validation import product_candidate_rejection_reason, product_candidate_review_reason
 
+
+
+# --- from test_categories.py ---
+ENGINE_DIR = Path(__file__).resolve().parents[1] / "src"
+
+# --- from test_categories.py ---
+sys.path.insert(0, str(ENGINE_DIR))
+
+# --- from test_categories.py ---
 def test_taxonomy_has_29_unique_main_categories_and_separates_general_from_review():
     assert len(promo_categories.CATEGORY_TAXONOMY) == 29
     assert len(promo_categories.CATEGORY_NAMES) == len(set(promo_categories.CATEGORY_NAMES)) == 29
@@ -25,7 +39,7 @@ def test_taxonomy_has_29_unique_main_categories_and_separates_general_from_revie
         "Lainnya / Perlu Review", "Produk belum teridentifikasi"
     )
 
-
+# --- from test_categories.py ---
 def test_common_product_types_map_to_expected_category_and_subcategory():
     cases = [
         ("Beras premium 5 kg", "Makanan & Bahan Pokok", "Beras"),
@@ -63,7 +77,7 @@ def test_common_product_types_map_to_expected_category_and_subcategory():
             expected_category, expected_subcategory
         ), product
 
-
+# --- from test_categories.py ---
 def test_packaged_food_and_restaurant_promos_have_separate_main_categories():
     assert promo_categories.classify_promo_category({"product_text": "Indomie Goreng 5 pcs"}) == (
         "Snack & Makanan Kemasan", "Mi instan"
@@ -75,7 +89,7 @@ def test_packaged_food_and_restaurant_promos_have_separate_main_categories():
         "Promo Umum / Multi-Kategori", "Kampanye Umum"
     )
 
-
+# --- from test_categories.py ---
 def test_product_category_is_prioritized_over_campaign_discount_language():
     row = {
         "product_text": "Susu UHT Full Cream 1 L",
@@ -84,7 +98,7 @@ def test_product_category_is_prioritized_over_campaign_discount_language():
     }
     assert promo_categories.classify_promo_category(row)[0] == "Minuman & Produk Susu"
 
-
+# --- from test_categories.py ---
 def test_multisource_adapter_emits_category_fields():
     meta = collector.parse_promo_metadata("Promo Supermarket 23-25 Oktober 2026", "", "Berlaku 23-25 Oktober 2026")
     row = collector.make_product_row(
@@ -100,7 +114,7 @@ def test_multisource_adapter_emits_category_fields():
     assert row["product_category"] == "Cuci Pakaian"
     assert row["product_subcategory"] == "Deterjen"
 
-
+# --- from test_categories.py ---
 def test_clean_excel_rows_include_filterable_category_columns_and_reference_sheets():
     row = {
         "product_text": "Rinso deterjen cair 700 ml",
@@ -144,7 +158,7 @@ def test_clean_excel_rows_include_filterable_category_columns_and_reference_shee
         finally:
             workbook.close()
 
-
+# --- from test_categories.py ---
 def test_category_change_audit_uses_previous_source_label():
     from tempfile import TemporaryDirectory
     from openpyxl import load_workbook
@@ -177,7 +191,7 @@ def test_category_change_audit_uses_previous_source_label():
         finally:
             workbook.close()
 
-
+# --- from test_categories.py ---
 def test_ambiguous_brand_and_flavour_words_do_not_override_product_type():
     cases = {
         "Rejoice Shampoo Hijab 170 ml": ("Perawatan Rambut & Kulit", "Sampo"),
@@ -230,7 +244,7 @@ def test_ambiguous_brand_and_flavour_words_do_not_override_product_type():
     for product, expected in cases.items():
         assert promo_categories.classify_promo_category({"product_text": product}) == expected, product
 
-
+# --- from test_categories.py ---
 def test_classifier_never_emits_a_category_outside_the_reference_taxonomy():
     examples = [
         "Beras premium 5 kg",
@@ -245,7 +259,7 @@ def test_classifier_never_emits_a_category_outside_the_reference_taxonomy():
         category, _ = promo_categories.classify_promo_category({"product_text": product})
         assert category in promo_categories.CATEGORY_NAMES, (product, category)
 
-
+# --- from test_categories.py ---
 def test_category_classifier_reuses_compiled_regex_patterns():
     cache = promo_categories._COMPILED_PATTERN_CACHE
     cache.clear()
@@ -259,10 +273,77 @@ def test_category_classifier_reuses_compiled_regex_patterns():
     assert compiled_count > 0
     assert len(cache) == compiled_count
 
-
+# --- from test_categories.py ---
 def test_category_classifier_recovers_truncated_product_name_from_original():
     row = {
         "product_text": "Pasti",
         "original_product_text": "Pasti Hemat 1000 sheet Facial Tissue 1000 sheet",
     }
     assert promo_categories.classify_promo_category(row) == ("Tisu & Produk Kertas", "Tisu wajah")
+
+# --- from test_dynamic_validation.py ---
+sys.path.insert(0, str(ENGINE_DIR))
+
+# --- from test_dynamic_validation.py ---
+def test_unknown_future_merchants_are_inferred_without_allowlist():
+    # Names are intentionally not present in ALIAS_GROUPS. New merchants should
+    # still be discoverable from promo/catalog titles and should not be rejected.
+    assert collector.infer_merchant_dynamic("Promo All Fruit 23-25 Oktober 2026") == "All Fruit"
+    assert collector.infer_merchant_dynamic("Katalog Promo All Sayur Minggu Ini 23-25 Oktober 2026") == "All Sayur"
+    assert collector.infer_merchant_dynamic("Promo JSM Fresh Basket 23-25 Oktober 2026") == "Fresh Basket"
+    # Known merchants still receive canonical names.
+    assert collector.infer_merchant_dynamic("Promo JSM Alfamart 23-25 Oktober 2026") == "Alfamart"
+
+# --- from test_dynamic_validation.py ---
+def test_future_merchant_name_is_not_a_product_denylist_entry():
+    row = {
+        "product_text": "All Fruit Apples Fuji 1 kg",
+        "merchant_name": "All Fruit",
+        "offer_text": "Harga Promo Rp12.900, Harga Normal Rp15.900",
+        "normal_price": 15900,
+        "promo_price": 12900,
+        "raw_line": "All Fruit Apples Fuji 1 kg — Harga Promo Rp12.900, Harga Normal Rp15.900",
+        "source_url": "https://example.test/promo-all-fruit/",
+        "source_item_url": "https://example.test/products/apples-fuji-1kg/",
+    }
+    assert product_candidate_rejection_reason(row, "hemat_card") is None
+    assert product_candidate_review_reason(row, "hemat_card") is None
+
+    # A bare candidate matching the merchant is ambiguous, but kept for review,
+    # not permanently discarded by a static deny-list.
+    ambiguous = {
+        "product_text": "All Sayur",
+        "merchant_name": "All Sayur",
+        "offer_text": "Beli 1 Gratis 1",
+        "purchase_condition": "Beli 1 Gratis 1",
+        "source_url": "https://example.test/promo-all-sayur/",
+    }
+    assert product_candidate_rejection_reason(ambiguous, "article") is None
+    assert product_candidate_review_reason(ambiguous, "article") == "ambiguous_candidate_matches_merchant_label"
+
+# --- from test_dynamic_validation.py ---
+def test_unknown_merchant_can_be_resolved_from_card_context():
+    from bs4 import BeautifulSoup
+
+    html = """<div class="product-card">
+      <a href="/products/apple-fuji-1kg">Apple Fuji 1 kg — Harga Promo Rp12.900</a>
+      <a href="/merchant/all-fruit">All Fruit</a>
+    </div>"""
+    rows = collector.extract_hemat_cards(
+        BeautifulSoup(html, "html.parser"),
+        "https://www.hemat.id/katalog-all-fruit/",
+    )
+    assert rows, "structured product card should be extracted"
+    assert rows[0]["merchant_name"] == "All Fruit", rows[0]
+
+# --- from test_dynamic_validation.py ---
+def test_directly_priced_short_name_can_be_kept_without_brand_allowlist():
+    row = {
+        "product_text": "All Fruit",
+        "offer_text": "Harga Promo Rp12.900",
+        "promo_price": 12900,
+        "raw_line": "All Fruit → Harga Promo Rp12.900",
+        "source_name": "Katalogpromosi.com",
+    }
+    assert product_candidate_rejection_reason(row, "article") is None
+    assert product_candidate_review_reason(row, "article") is None

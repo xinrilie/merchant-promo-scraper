@@ -1,18 +1,29 @@
+"""Grouped regression tests. Cases are organized by functional area."""
+
+
+
 from __future__ import annotations
 
 import csv
+
 from datetime import date, datetime
+
 from pathlib import Path
+
 from zoneinfo import ZoneInfo
 
 import pytest
 
 import promo_history as history
+
 import promo_multisource_collector as collector
 
+
+
+# --- from test_promo_history.py ---
 JAKARTA = ZoneInfo("Asia/Jakarta")
 
-
+# --- from test_promo_history.py ---
 def offer(*, promo_price="12900", valid_until="2026-11-10", valid_from="2026-11-01", offer_text="Harga Promo Rp12.900"):
     return {
         "product_text": "Fresh Basket Potato Chips 200 g",
@@ -35,7 +46,7 @@ def offer(*, promo_price="12900", valid_until="2026-11-10", valid_from="2026-11-
         "retained_from_previous_run": False,
     }
 
-
+# --- from test_promo_history.py ---
 def test_history_upserts_without_duplicate_and_carries_unseen_valid_offer():
     now1 = datetime(2026, 11, 3, 9, 0, tzinfo=JAKARTA)
     first = history.update_history([], [offer()], run_id="run-1", now=now1, today=date(2026, 11, 3))
@@ -61,7 +72,7 @@ def test_history_upserts_without_duplicate_and_carries_unseen_valid_offer():
     assert carry[0]["presence_status"] == "not_seen_this_run"
     assert carry[0]["promo_status"] == "active"
 
-
+# --- from test_promo_history.py ---
 def test_expired_offer_remains_in_history_but_is_not_carried_to_current_snapshot():
     seeded = history.seed_history_from_snapshot(
         [offer(valid_from="2026-10-01", valid_until="2026-10-31")],
@@ -75,7 +86,7 @@ def test_expired_offer_remains_in_history_but_is_not_carried_to_current_snapshot
     assert updated[0]["history_record_status"] == "expired"
     assert history.carry_forward_rows(updated, [], today=date(2026, 11, 3)) == []
 
-
+# --- from test_promo_history.py ---
 def test_unknown_period_offer_has_limited_review_grace():
     unknown_offer = offer(valid_from="", valid_until="", offer_text="Diskon untuk produk pilihan")
     unknown_offer["scraped_at"] = "2026-11-01T09:00:00+07:00"
@@ -90,7 +101,7 @@ def test_unknown_period_offer_has_limited_review_grace():
     assert "periode belum jelas" in recent[0]["retention_reason"].casefold()
     assert stale == []
 
-
+# --- from test_promo_history.py ---
 def test_changed_price_supersedes_old_offer_but_keeps_both_versions_in_history():
     day1 = datetime(2026, 11, 3, 9, 0, tzinfo=JAKARTA)
     original = offer(promo_price="12900", offer_text="Harga Promo Rp12.900")
@@ -105,7 +116,7 @@ def test_changed_price_supersedes_old_offer_but_keeps_both_versions_in_history()
     assert old["superseded_by_history_id"] == new["history_id"]
     assert old["history_id"] not in {row["history_id"] for row in history.carry_forward_rows(second, [refreshed], today=date(2026, 11, 4))}
 
-
+# --- from test_promo_history.py ---
 def test_history_csv_save_load_and_export_are_atomic_and_readable(tmp_path):
     rows = history.update_history(
         [], [offer()], run_id="run-csv",
@@ -125,7 +136,7 @@ def test_history_csv_save_load_and_export_are_atomic_and_readable(tmp_path):
     assert len(exported) == 1
     assert exported[0]["product_text"] == "Fresh Basket Potato Chips 200 g"
 
-
+# --- from test_promo_history.py ---
 def test_seed_migration_preserves_all_snapshot_rows_and_source_provenance():
     rows = [
         offer(),
@@ -136,7 +147,7 @@ def test_seed_migration_preserves_all_snapshot_rows_and_source_provenance():
     assert set(seeded[0]["history_source_names"].split(" | ")) == {"Hemat.id", "Scanharga.com"}
     assert set(seeded[0]["history_source_urls"].split(" | ")) == {rows[0]["source_url"], rows[1]["source_url"]}
 
-
+# --- from test_promo_history.py ---
 def test_collector_main_migrates_snapshot_and_keeps_unseen_valid_rows(tmp_path, monkeypatch):
     import sys
     from datetime import date
@@ -202,7 +213,7 @@ def test_collector_main_migrates_snapshot_and_keeps_unseen_valid_rows(tmp_path, 
     assert not (runtime / "promo_multisource_products_active.csv").exists()
     assert not (runtime / "promo_multisource_products_review.csv").exists()
 
-
+# --- from test_promo_history.py ---
 def test_collector_main_keeps_expired_rows_in_history_not_current_snapshot(tmp_path, monkeypatch):
     import sys
     from datetime import date
@@ -254,7 +265,7 @@ def test_collector_main_keeps_expired_rows_in_history_not_current_snapshot(tmp_p
     assert expired_history["history_promo_status"] == "expired"
     assert expired_history["history_record_status"] == "expired"
 
-
+# --- from test_promo_history.py ---
 def test_collector_does_not_overwrite_last_good_snapshot_when_all_sources_empty(tmp_path, monkeypatch):
     import sys
     from datetime import date
@@ -299,7 +310,7 @@ def test_collector_does_not_overwrite_last_good_snapshot_when_all_sources_empty(
     assert (runtime / "promo_multisource_products_all.csv").read_text(encoding="utf-8-sig") == previous_content
     assert (output / "Riwayat_Promo.csv").is_file()
 
-
+# --- from test_promo_history.py ---
 def test_existing_history_is_backfilled_from_legacy_snapshot_without_faking_seen_count():
     now = datetime(2026, 11, 3, 9, 0, tzinfo=JAKARTA)
     existing_offer = offer()
@@ -313,7 +324,7 @@ def test_existing_history_is_backfilled_from_legacy_snapshot_without_faking_seen
     assert migrated["seen_count"] == 1
     assert migrated["last_seen_at"] == "2026-10-30T09:00:00+07:00"
 
-
+# --- from test_promo_history.py ---
 def test_collector_health_marks_partial_fresh_and_carried_rows():
     products = [
         {"source_name": "Hemat.id", "product_text": "Fresh 100 g", "retained_from_previous_run": False},
@@ -325,7 +336,7 @@ def test_collector_health_marks_partial_fresh_and_carried_rows():
     assert report["Hemat.id"]["fresh_product_rows"] == 1
     assert report["Hemat.id"]["preserved_previous_rows"] == 1
 
-
+# --- from test_promo_history.py ---
 def test_same_dated_offer_from_different_aggregator_title_updates_one_history_record():
     first = offer()
     second = {
@@ -343,7 +354,7 @@ def test_same_dated_offer_from_different_aggregator_title_updates_one_history_re
     assert len(result) == 1
     assert set(result[0]["history_source_names"].split(" | ")) == {"Hemat.id", "Scanharga.com"}
 
-
+# --- from test_promo_history.py ---
 def test_scanharga_only_history_uses_shorter_carry_forward_window_and_keeps_archive():
     scan = offer()
     scan.update({
@@ -368,7 +379,7 @@ def test_scanharga_only_history_uses_shorter_carry_forward_window_and_keeps_arch
     assert history_rows[0]["presence_status"] == "not_seen_beyond_carry_window"
     assert "Riwayat tetap disimpan" in history_rows[0]["retention_reason"]
 
-
+# --- from test_promo_history.py ---
 def test_multi_source_offer_uses_longest_source_retention_window():
     mixed = offer()
     mixed.update({
@@ -386,7 +397,7 @@ def test_multi_source_offer_uses_longest_source_retention_window():
     assert len(carried) == 1
     assert carried[0]["carry_forward_max_age_days"] == 21
 
-
+# --- from test_promo_history.py ---
 def test_collector_source_health_reports_article_and_image_yield():
     products = [
         {"source_name": "Scanharga.com", "product_text": "Only Product 100 g", "retained_from_previous_run": False},
@@ -409,7 +420,7 @@ def test_collector_source_health_reports_article_and_image_yield():
     assert source["articles_with_textual_product_rows"] == 1
     assert source["image_references_found"] == 10
 
-
+# --- from test_promo_history.py ---
 def test_hemat_and_katalogpromosi_have_distinct_carry_forward_windows():
     for source_name, expected_age in (("Hemat.id", 21), ("Katalogpromosi.com", 14)):
         row = offer()

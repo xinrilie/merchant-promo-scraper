@@ -1,23 +1,36 @@
+"""Grouped regression tests. Cases are organized by functional area."""
+
+
+
 from __future__ import annotations
 
 import csv
+
 import sys
+
 from datetime import date
+
 from pathlib import Path
 
 from openpyxl import load_workbook
-
-SRC = Path(__file__).resolve().parents[1] / "src"
-sys.path.insert(0, str(SRC))
 
 from promo_sku_review import (  # noqa: E402
     classify_candidate,
     export_review_workbook,
     import_review_approvals,
 )
-from promo_names import load_product_name_aliases, product_name_matching_key  # noqa: E402
+
+from promo_names import load_product_name_aliases, product_name_matching_key
 
 
+
+# --- from test_sku_review_workflow.py ---
+SRC = Path(__file__).resolve().parents[1] / "src"
+
+# --- from test_sku_review_workflow.py ---
+sys.path.insert(0, str(SRC))
+
+# --- from test_sku_review_workflow.py ---
 def candidate(query: str, reference: str, **overrides):
     row = {
         "query_product": query,
@@ -34,7 +47,7 @@ def candidate(query: str, reference: str, **overrides):
     row.update(overrides)
     return row
 
-
+# --- from test_sku_review_workflow.py ---
 def test_known_brand_conflicts_are_rejected_before_similarity():
     samples = [
         ("Bimoli Minyak Goreng Spesial 2 L", "Sania Minyak Goreng 2 L"),
@@ -48,7 +61,7 @@ def test_known_brand_conflicts_are_rejected_before_similarity():
         assert result["Keputusan"] == "TOLAK"
         assert result["Kecocokan Merek"] == "false"
 
-
+# --- from test_sku_review_workflow.py ---
 def test_alternative_size_does_not_match_a_single_fixed_pack():
     result = classify_candidate(
         candidate("Bango Kecap Manis 920 / 950 g", "Bango Kecap Manis 950 g"),
@@ -57,7 +70,7 @@ def test_alternative_size_does_not_match_a_single_fixed_pack():
     assert result["Klasifikasi Kandidat"] == "reject_package_mismatch"
     assert result["Kecocokan Ukuran"] == "false"
 
-
+# --- from test_sku_review_workflow.py ---
 def test_different_formula_or_flavour_is_rejected():
     result = classify_candidate(
         candidate("Ciptadent Pasta Gigi Cool Mint 190 g", "Ciptadent Pasta Gigi Fresh Mint 190 g"),
@@ -65,7 +78,7 @@ def test_different_formula_or_flavour_is_rejected():
     )
     assert result["Klasifikasi Kandidat"] == "reject_variant_mismatch"
 
-
+# --- from test_sku_review_workflow.py ---
 def test_different_explicit_packaging_is_rejected():
     result = classify_candidate(
         candidate("Tropical Minyak Goreng PET 2 L", "Tropical Minyak Goreng Pouch 2 L"),
@@ -73,7 +86,7 @@ def test_different_explicit_packaging_is_rejected():
     )
     assert result["Klasifikasi Kandidat"] == "reject_packaging_mismatch"
 
-
+# --- from test_sku_review_workflow.py ---
 def test_same_sku_across_merchants_is_market_reference_only_not_automatic_alias():
     result = classify_candidate(
         candidate("Bango Kecap Manis Pouch 700 g", "Bango Kecap Manis 700 g"),
@@ -86,7 +99,7 @@ def test_same_sku_across_merchants_is_market_reference_only_not_automatic_alias(
     assert result["Klasifikasi Kandidat"] == "manual_review_same_brand_package_variant"
     assert result["Keputusan"] == "BELUM DIREVIEW"
 
-
+# --- from test_sku_review_workflow.py ---
 def test_stale_candidate_is_explicitly_archival_only():
     result = classify_candidate(
         candidate("Bango Kecap Manis 700 g", "Bango Kecap Manis 700 g", candidate_observed_at="2026-09-01"),
@@ -95,7 +108,7 @@ def test_stale_candidate_is_explicitly_archival_only():
     assert "hanya untuk arsip" in result["Rekomendasi"]
     assert result["Keputusan"] == "BELUM DIREVIEW"
 
-
+# --- from test_sku_review_workflow.py ---
 def test_review_workbook_exports_candidates_and_preserves_decisions(tmp_path):
     source = tmp_path / "candidates.csv"
     fields = list(candidate("Bango Kecap Manis 700 g", "Bango Kecap Manis 700 g"))
@@ -127,7 +140,7 @@ def test_review_workbook_exports_candidates_and_preserves_decisions(tmp_path):
     finally:
         wb.close()
 
-
+# --- from test_sku_review_workflow.py ---
 def test_unknown_brand_alias_requires_evidence_when_importing_review(tmp_path):
     source = tmp_path / "candidates.csv"
     row = candidate("Produk Lokal Teh Celup 25 bags", "Produk Lokal Teh Celup 25 bags")
@@ -156,7 +169,7 @@ def test_unknown_brand_alias_requires_evidence_when_importing_review(tmp_path):
     assert result["rejected_decisions"] == 1
     assert not aliases.read_text(encoding="utf-8-sig").strip().endswith(",yes,,")
 
-
+# --- from test_sku_review_workflow.py ---
 def test_approved_alias_loader_keeps_legacy_note_compatibility_and_rejects_brand_conflict(tmp_path):
     aliases = tmp_path / "aliases.csv"
     aliases.write_text(
@@ -175,7 +188,7 @@ def test_approved_alias_loader_keeps_legacy_note_compatibility_and_rejects_brand
         "Sania Minyak Goreng 2 L"
     )
 
-
+# --- from test_sku_review_workflow.py ---
 def test_known_brand_alias_can_be_imported_after_manual_approval(tmp_path):
     source = tmp_path / "candidates.csv"
     row = candidate("Bango Kecap Manis Pch 700 g", "Bango Kecap Manis 700 g")

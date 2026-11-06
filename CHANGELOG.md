@@ -1,6 +1,12 @@
 # Riwayat Perubahan
 
 ## 6 November 2026
+- Menggabungkan 27 modul tes menjadi 13 modul tematik; seluruh 219 kasus pytest tetap dipertahankan.
+- Menghapus dua fungsi `main()` ad-hoc di file tes karena seluruh eksekusi tes sudah dilakukan oleh pytest.
+- Memperbarui paket lokal dengan seluruh file output terbaru dari arsip output yang diberikan; folder runtime dan state lama tetap dipertahankan.
+- Paket source untuk GitHub tetap bersih dari output, runtime, state, cache, dan virtual environment.
+
+## 6 November 2026
 - Percepatan pencocokan referensi harga dengan indeks SKU yang dinormalisasi sekali per batch, bukan menormalisasi seluruh referensi untuk setiap baris katalog.
 - Pencarian kandidat SKU memakai inverted token index agar hanya membandingkan referensi yang memiliki token produk yang relevan. Kandidat fuzzy tetap untuk review dan tidak pernah memasang harga otomatis.
 - LIVE 3/4 kini menampilkan durasi pembaruan database, pencocokan SKU, pembandingan harga, quality gate, ekspor, dan total proses.

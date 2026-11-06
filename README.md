@@ -45,12 +45,19 @@ Jangan menambahkan alias hanya karena dua nama terlihat mirip. Pastikan merek, m
 - `run.bat --export-sku-review` mengekspor workbook review, sedangkan `run.bat --import-sku-review` mengimpor alias yang disetujui dan membangun ulang katalog dari snapshot tanpa scraping live.
 - File alias baru menggunakan kolom `alias,canonical_name,approved,verification_note,evidence_url`. Loader tetap membaca kolom `note` pada file alias lama agar data kurasi sebelumnya tidak hilang.
 
+## Tes regresi
+
+- Folder `tests/` diringkas menjadi 13 modul tematik agar lebih mudah dinavigasi.
+- Seluruh 219 kasus pytest tetap dipertahankan; penggabungan tidak mengurangi cakupan tes.
+- Jalankan `run.bat --test-only` untuk pemeriksaan offline atau `python -m pytest -q -p no:cacheprovider tests` dari root proyek.
+- Dua fungsi `main()` lama yang hanya memanggil ulang tes satu per satu dihapus; pytest menjadi runner tes.
+
 ## Struktur proyek
 
 ```text
 .
 ├── src/          # collector, validasi, referensi harga, health check, dan ekspor
-├── tests/        # tes regresi offline
+├── tests/        # 13 modul tematik, 219 tes regresi offline
 ├── config/       # konfigurasi kategori dan alias SKU yang disetujui manual
 ├── data/         # seed referensi awal dan referensi yang ditinjau manual
 ├── output/       # katalog Excel/CSV; dibuat saat dijalankan, jangan commit
