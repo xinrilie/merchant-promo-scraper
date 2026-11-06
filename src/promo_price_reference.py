@@ -18,6 +18,8 @@ from typing import Iterable
 from promo_names import (
     clean_product_name, product_name_size_signature, product_name_variant_signature,
     product_name_matching_key, product_name_package_match_signature, product_name_similarity,
+    product_name_brand_signature, product_name_brand_match,
+    product_name_packaging_signature, product_name_packaging_match,
 )
 from promo_evidence import find_amount_evidence
 from promo_campaign_utils import normalize_text
@@ -588,8 +590,10 @@ def find_reference_price(
 PRICE_MATCH_CANDIDATE_FIELDS = [
     "query_product", "query_merchant", "candidate_product", "candidate_merchant",
     "candidate_normal_price", "candidate_observed_at", "candidate_source_name",
-    "candidate_source_url", "similarity_score", "package_match", "variant_match",
-    "merchant_match", "suggestion_reason", "automatic_match_allowed",
+    "candidate_source_url", "similarity_score", "query_brand", "candidate_brand",
+    "brand_match", "package_match", "variant_match", "packaging_match", "merchant_match",
+    "merchant_scope", "review_classification", "review_priority",
+    "suggestion_reason", "automatic_match_allowed",
 ]
 
 
@@ -642,15 +646,44 @@ def suggest_reference_price_candidates(
             continue
         package_match = item["package_signature"] == query_package
         variant_match = item["variant_signature"] == query_variant
+        query_brand = product_name_brand_signature(query)
+        candidate_brand = product_name_brand_signature(candidate_text)
+        brand_match_value = product_name_brand_match(query, candidate_text)
+        brand_match = "unknown" if brand_match_value is None else str(brand_match_value).lower()
+        packaging_value = product_name_packaging_match(query, candidate_text)
+        packaging_match = "unknown" if packaging_value is None else str(packaging_value).lower()
         merchant_match = bool(query_merchant) and item["merchant_key"] == query_merchant
         row = item["row"]
-        rank_score = similarity + (0.12 if package_match else 0.0) + (0.10 if variant_match else 0.0) + (0.04 if merchant_match else 0.0)
-        if not package_match:
+        if brand_match == "false":
+            classification = "reject_brand_mismatch"
+            priority = "reject"
+            reason = "Merek berbeda; kandidat tidak boleh dipakai sebagai SKU yang sama"
+        elif not package_match:
+            classification = "reject_package_mismatch"
+            priority = "reject"
             reason = "Nama mirip, tetapi ukuran/kemasan berbeda; tidak boleh dicocokkan otomatis"
         elif not variant_match:
+            classification = "reject_variant_mismatch"
+            priority = "reject"
             reason = "Nama mirip, tetapi varian berbeda; tidak boleh dicocokkan otomatis"
+        elif packaging_match == "false":
+            classification = "reject_packaging_mismatch"
+            priority = "reject"
+            reason = "Jenis kemasan berbeda; tidak boleh dicocokkan sebagai alias otomatis"
+        elif brand_match == "true":
+            classification = "manual_review_same_brand_package_variant"
+            priority = "high" if similarity >= 0.82 else "medium"
+            reason = "Merek, ukuran, dan varian cocok; periksa apakah perbedaan nama hanya penulisan/kemasan"
         else:
-            reason = "Kemungkinan perbedaan penulisan/alias; wajib verifikasi SKU manual"
+            classification = "manual_review_brand_unknown"
+            priority = "low"
+            reason = "Merek tidak dapat diidentifikasi dengan aman; perlu verifikasi produk manual"
+        merchant_scope = "same_merchant" if merchant_match else "cross_merchant_market_reference_only"
+        rank_score = (
+            similarity + (0.14 if brand_match == "true" else 0.0)
+            + (0.12 if package_match else 0.0) + (0.10 if variant_match else 0.0)
+            + (0.04 if merchant_match else 0.0) - (0.25 if brand_match == "false" else 0.0)
+        )
         candidates.append({
             "query_product": query,
             "query_merchant": str(merchant_name or ""),
@@ -661,9 +694,16 @@ def suggest_reference_price_candidates(
             "candidate_source_name": row.get("source_name", ""),
             "candidate_source_url": row.get("source_url", ""),
             "similarity_score": round(similarity, 4),
+            "query_brand": query_brand,
+            "candidate_brand": candidate_brand,
+            "brand_match": brand_match,
             "package_match": str(package_match).lower(),
             "variant_match": str(variant_match).lower(),
+            "packaging_match": packaging_match,
             "merchant_match": str(merchant_match).lower(),
+            "merchant_scope": merchant_scope,
+            "review_classification": classification,
+            "review_priority": priority,
             "suggestion_reason": reason,
             "automatic_match_allowed": "no",
             "_rank_score": rank_score,

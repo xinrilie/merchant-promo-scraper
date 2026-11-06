@@ -1,6 +1,6 @@
 # Merchant Promo Scraper
 
-Versi source: **v11** — pencocokan SKU exact yang memahami kesetaraan satuan fisik, alias nama produk yang harus disetujui manual, dan daftar kandidat mirip untuk pemeriksaan tanpa menerapkan harga otomatis. Lihat [CHANGELOG.md](CHANGELOG.md) dan [AUDIT_UPGRADE_V11.md](AUDIT_UPGRADE_V11.md).
+Versi source: **v12** — alur review kandidat SKU manual, normalisasi merek/ukuran/varian/jenis kemasan yang lebih ketat, pemisahan fresh vs carry-forward pada katalog harian, dan antrean harga yang tetap menyimpan kandidat di luar katalog utama. Lihat [CHANGELOG.md](CHANGELOG.md) dan [AUDIT_UPGRADE_V12.md](AUDIT_UPGRADE_V12.md).
 
 Pipeline Python untuk mengambil data promo dari halaman publik Hemat.id, Katalogpromosi.com, dan Scanharga.com. Proyek ini mengambil teks/HTML serta metadata gambar yang tersedia di halaman. **Poster hanya direferensikan lewat URL; gambar tidak dibaca, tidak di-OCR, dan tidak dipakai untuk menebak harga.**
 
@@ -24,11 +24,24 @@ Pipeline Python untuk mengambil data promo dari halaman publik Hemat.id, Katalog
 Format `config/product_name_aliases.csv`:
 
 ```csv
-alias,canonical_name,approved,note
-Sari Wangi Teh Celup 25 bags,SariWangi Teh Celup 25 bags,true,Alias merek sudah diperiksa
+alias,canonical_name,approved,verification_note,evidence_url
+Sari Wangi Teh Celup 25 bags,SariWangi Teh Celup 25 bags,true,Penulisan merek diverifikasi,https://contoh.id/produk
 ```
 
-Jangan menambahkan alias hanya karena dua nama terlihat mirip. Pastikan merek, model, varian, ukuran, isi/pack, dan konteks produknya benar-benar sama. Baris dengan `approved` selain `true/yes/1/approved/setuju`, konflik alias, atau ukuran/varian berbeda akan diabaikan.
+Jangan menambahkan alias hanya karena dua nama terlihat mirip. Pastikan merek, model, varian, ukuran, isi/pack, jenis kemasan, dan konteks produknya benar-benar sama. Baris dengan `approved` selain `true/yes/1/approved/setuju`, konflik alias, ukuran/varian/kemasan berbeda, atau bukti yang tidak memadai akan diabaikan. Kolom `note` lama tetap dapat dibaca untuk menjaga kompatibilitas file kurasi terdahulu.
+
+## Perubahan v12 — SKU review, freshness, dan antrean harga yang tidak membuang kandidat
+
+- Kandidat fuzzy dari `runtime/price_reference_match_candidates.csv` sekarang dapat diekspor ke `output/Review_Kandidat_SKU.xlsx`. Setiap kandidat diperiksa dengan merek terkurasi, ukuran/isi, varian, jenis kemasan, merchant pembanding, URL, dan umur data.
+- Merek yang diketahui berbeda, ukuran alternatif yang ambigu, varian berbeda, atau jenis kemasan yang bertentangan diklasifikasikan sebagai `TOLAK`. Kandidat lain hanya berstatus `BELUM DIREVIEW`; tidak ada harga yang otomatis dipasang ke produk.
+- Kandidat lintas merchant diberi label `cross_merchant_market_reference_only`. Ini boleh menjadi referensi pasar setelah SKU disetujui, tetapi bukan bukti harga retailer promo yang sama.
+- Alias SKU hanya diimpor melalui keputusan manual `APPROVE_ALIAS`. Jika merek tidak dapat diidentifikasi otomatis, reviewer wajib mengisi URL bukti identitas SKU dan catatan. Alias yang memiliki konflik merek/ukuran/varian/kemasan atau dipetakan ke dua SKU berbeda ditolak.
+- Keputusan reviewer, URL bukti, dan catatan dipertahankan ketika workbook kandidat dibuat ulang selama ID kandidat tetap sama. ID berubah jika harga, waktu observasi, atau bukti sumber kandidat berubah.
+- Workbook katalog harian sekarang memisahkan `Promo` (fresh tanpa review), `Promo Aktif - Review` (fresh yang perlu dicek), `Promo Dipertahankan` (carry-forward yang masih berlaku), dan `Perlu Diperiksa` (review di luar snapshot). Ringkasan `Mulai Di Sini` dihitung dari bucket yang sama.
+- CSV katalog ringkas hanya memuat promo fresh tanpa review tambahan; data carry-forward tetap ada di Excel, snapshot teknis, dan riwayat.
+- Workbook pencarian harga menambahkan sheet `Di Luar Katalog` untuk kandidat eligible yang tidak masuk katalog utama saat run tersebut. Baris ini tidak langsung diimpor ke harga; reviewer harus mengecek status dan SKU dahulu. Isian manual di sheet ini dipertahankan pada rebuild berikutnya.
+- `run.bat --export-sku-review` mengekspor workbook review, sedangkan `run.bat --import-sku-review` mengimpor alias yang disetujui dan membangun ulang katalog dari snapshot tanpa scraping live.
+- File alias baru menggunakan kolom `alias,canonical_name,approved,verification_note,evidence_url`. Loader tetap membaca kolom `note` pada file alias lama agar data kurasi sebelumnya tidak hilang.
 
 ## Struktur proyek
 
@@ -109,7 +122,21 @@ Bangun ulang katalog dari snapshot terakhir tanpa mengulang scraping live (bergu
 run.bat --rebuild-from-last-snapshot
 ```
 
-Mode ini menjalankan pra-tes terlebih dahulu, lalu memproses `runtime/promo_multisource_products_all.csv`, membuat ulang workbook pencarian harga, dan memverifikasi output. Snapshot runtime lama harus tersedia.
+Mode ini menjalankan pra-tes terlebih dahulu, lalu memproses `runtime/promo_multisource_products_all.csv`, membuat ulang workbook review SKU dan pencarian harga, serta memverifikasi output. Snapshot runtime lama harus tersedia.
+
+Buat workbook review kandidat pencocokan SKU dari CSV kandidat yang sudah ada:
+
+```bat
+run.bat --export-sku-review
+```
+
+Setelah keputusan manual disimpan pada kolom `Keputusan` di `output/Review_Kandidat_SKU.xlsx`, impor alias yang disetujui dan rebuild katalog tanpa scraping live:
+
+```bat
+run.bat --import-sku-review
+```
+
+Gunakan `APPROVE_ALIAS` hanya saat SKU memang sama. `TOLAK` menolak kandidat, `PERLU_BUKTI` menandai bukti yang belum cukup, dan `BELUM DIREVIEW` tidak mengubah database alias. Harga kandidat tidak pernah ditempel otomatis hanya karena suatu alias disetujui.
 
 Jalankan tes, scraping teks/HTML, health-check, konsolidasi, dan ekspor katalog:
 

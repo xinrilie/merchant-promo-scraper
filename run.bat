@@ -14,6 +14,8 @@ if /I "%~1"=="--test-only" set "MODE=test"
 if /I "%~1"=="--prepare-price-research" set "MODE=research"
 if /I "%~1"=="--import-price-research" set "MODE=import"
 if /I "%~1"=="--rebuild-from-last-snapshot" set "MODE=rebuild"
+if /I "%~1"=="--export-sku-review" set "MODE=sku_export"
+if /I "%~1"=="--import-sku-review" set "MODE=sku_import"
 set "PYTHON_EXE="
 set "PYTHON_ARGS="
 
@@ -73,6 +75,8 @@ if /I "%MODE%"=="check" (
     "%TEST_CMD%" %TEST_ARGS% -c "import sys, requests, bs4, openpyxl; raise SystemExit(0 if sys.version_info >= (3,11) else 1)" >nul 2>nul
 ) else if /I "%MODE%"=="import" (
     "%TEST_CMD%" %TEST_ARGS% -c "import sys, requests, bs4, openpyxl; raise SystemExit(0 if sys.version_info >= (3,11) else 1)" >nul 2>nul
+) else if /I "%MODE%"=="sku_export" (
+    "%TEST_CMD%" %TEST_ARGS% -c "import sys, requests, bs4, openpyxl; raise SystemExit(0 if sys.version_info >= (3,11) else 1)" >nul 2>nul
 ) else (
     "%TEST_CMD%" %TEST_ARGS% -c "import sys, requests, bs4, openpyxl, pytest; raise SystemExit(0 if sys.version_info >= (3,11) else 1)" >nul 2>nul
 )
@@ -92,6 +96,7 @@ set "CHECK_ARGS=--dev"
 if /I "%MODE%"=="check" set "CHECK_ARGS="
 if /I "%MODE%"=="research" set "CHECK_ARGS="
 if /I "%MODE%"=="import" set "CHECK_ARGS="
+if /I "%MODE%"=="sku_export" set "CHECK_ARGS="
 
 echo.
 echo =====================================================
@@ -106,6 +111,7 @@ if errorlevel 1 goto :dependency_error
 if /I "%MODE%"=="check" goto :check_success
 if /I "%MODE%"=="research" goto :prepare_price_research
 if /I "%MODE%"=="import" goto :import_price_research
+if /I "%MODE%"=="sku_export" goto :export_sku_review
 
 if not exist "%~dp0runtime" mkdir "%~dp0runtime"
 if not exist "%~dp0output" mkdir "%~dp0output"
@@ -133,6 +139,7 @@ if errorlevel 1 goto :error
 
 if /I "%MODE%"=="test" goto :test_success
 if /I "%MODE%"=="rebuild" goto :rebuild_last_snapshot
+if /I "%MODE%"=="sku_import" goto :import_sku_review
 
 echo.
 echo =====================================================
@@ -153,6 +160,8 @@ if errorlevel 1 goto :health_error
 echo.
 echo [LIVE 3/4] Menggabungkan sumber, validasi harga berbasis teks, dan ekspor...
 "%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\enrich_existing_promo_catalog_multisource.py"
+if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_sku_candidate_review.py"
 if errorlevel 1 goto :error
 
 echo.
@@ -202,6 +211,8 @@ echo.
 echo Membangun ulang katalog dari snapshot terakhir...
 "%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\enrich_existing_promo_catalog_multisource.py"
 if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_sku_candidate_review.py"
+if errorlevel 1 goto :error
 echo.
 echo Memperbarui daftar riset harga dan memverifikasi output...
 "%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_manual_price_search.py"
@@ -221,6 +232,8 @@ echo.
 echo Rebuild katalog dari snapshot terakhir tanpa mengambil data live...
 "%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\enrich_existing_promo_catalog_multisource.py"
 if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_sku_candidate_review.py"
+if errorlevel 1 goto :error
 "%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_manual_price_search.py"
 if errorlevel 1 goto :error
 "%PYTHON_EXE%" %PYTHON_ARGS% "%~dp0src\verify_outputs.py"
@@ -229,6 +242,49 @@ echo.
 echo Rebuild selesai. Snapshot sumber tidak diambil ulang.
 pause
 exit /b 0
+
+
+:export_sku_review
+if not exist "%~dp0runtime\price_reference_match_candidates.csv" goto :sku_candidates_missing
+if not exist "%~dp0output" mkdir "%~dp0output"
+echo.
+echo Mengekspor kandidat pencocokan SKU untuk review manual...
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_sku_candidate_review.py"
+if errorlevel 1 goto :error
+echo Selesai: output\Review_Kandidat_SKU.xlsx
+exit /b 0
+
+:import_sku_review
+if not exist "%~dp0output\Review_Kandidat_SKU.xlsx" goto :sku_review_missing
+if not exist "%~dp0runtime\promo_multisource_products_all.csv" goto :snapshot_missing
+echo.
+echo Mengimpor alias SKU yang disetujui secara manual...
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\import_sku_candidate_review.py" "%~dp0output\Review_Kandidat_SKU.xlsx"
+if errorlevel 1 goto :error
+echo.
+echo Membangun ulang katalog dari snapshot tanpa scraping live...
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\enrich_existing_promo_catalog_multisource.py"
+if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_sku_candidate_review.py"
+if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% -u "%~dp0src\export_manual_price_search.py"
+if errorlevel 1 goto :error
+"%PYTHON_EXE%" %PYTHON_ARGS% "%~dp0src\verify_outputs.py"
+if errorlevel 1 goto :error
+echo Alias SKU diimpor dan katalog diperbarui.
+pause
+exit /b 0
+
+:sku_candidates_missing
+echo ERROR: runtime\price_reference_match_candidates.csv belum ada.
+echo Jalankan run.bat atau run.bat --rebuild-from-last-snapshot dahulu.
+pause
+exit /b 1
+
+:sku_review_missing
+echo ERROR: output\Review_Kandidat_SKU.xlsx tidak ditemukan. Jalankan run.bat --export-sku-review dahulu.
+pause
+exit /b 1
 
 :snapshot_missing
 echo ERROR: runtime\promo_multisource_products_all.csv tidak ditemukan.
@@ -260,7 +316,9 @@ exit /b 0
 :no_python
 echo ERROR: Python 3.11+ dengan dependency yang cocok tidak ditemukan.
 echo Kandidat harus memiliki requests, beautifulsoup4 (bs4), dan openpyxl.
+if /I "%MODE%"=="sku_export" goto :no_python_runtime_only
 if /I not "%MODE%"=="check" if /I not "%MODE%"=="research" if /I not "%MODE%"=="import" echo Mode ini juga memerlukan pytest karena menjalankan tes offline dahulu.
+:no_python_runtime_only
 echo Set PROMO_PYTHON ke path python.exe dari instalasi Python yang lengkap.
 echo Contoh: set PROMO_PYTHON=D:\Python312\python.exe
 echo Launcher tidak membuat venv dan tidak memasang library otomatis.
@@ -304,6 +362,8 @@ echo   run.bat --check-only Cek Python/library runtime tanpa menjalankan pipelin
 echo   run.bat --prepare-price-research Buat workbook pencarian harga manual tanpa scraping
 echo   run.bat --import-price-research Impor referensi manual dan rebuild tanpa scraping live
 echo   run.bat --rebuild-from-last-snapshot Rebuild katalog lama tanpa scraping live
+echo   run.bat --export-sku-review Ekspor kandidat pencocokan SKU ke Excel
+echo   run.bat --import-sku-review Impor alias SKU yang disetujui manual lalu rebuild
 echo   run.bat --help       Tampilkan bantuan
 echo.
 echo Tidak ada pip install otomatis, venv lokal, atau pembacaan teks dari gambar.

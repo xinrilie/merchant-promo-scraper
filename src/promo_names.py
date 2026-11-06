@@ -5,6 +5,7 @@ import re
 from difflib import SequenceMatcher
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def _clean_space(value: object) -> str:
@@ -254,6 +255,85 @@ def product_name_block_key(value: object) -> str:
     return text.split()[0] if text else ""
 
 
+# Curated brand signatures used only as a hard safety check for fuzzy candidates.
+# This is deliberately not a general-purpose brand classifier: unknown brands stay
+# unknown and therefore require manual review rather than being guessed.
+_BRAND_PHRASES = [
+    "frisian flag", "ultra milk", "le minerale", "super sol", "lee kum kee",
+    "kapal api", "my baby", "mama lemon", "mama lime", "so klin",
+    "wall s", "close up", "life buoy", "lifebuoy", "beng beng",
+    "alfamart", "indomaret", "alfamidi", "superindo", "tip top",
+    "lotte mart", "lotte", "sariwangi", "greenfields", "oatside",
+    "benfarm", "barelab", "ciptadent", "pepsodent", "vaseline",
+    "sunlight", "bimoli", "sania", "sunco", "fortune", "tropical",
+    "sovia", "vipco", "pristine", "nestle", "aqua", "sosro",
+    "quaker", "lang", "wizz", "vanish", "wipol", "merries",
+    "sweety", "dettol", "cimory", "biokul", "perfetto", "fiesta",
+    "belfoods", "chitato", "japota", "chuba", "tango", "indomie",
+    "sedaap", "milo", "torabika", "kodomo", "hit", "rinso",
+    "attack", "lifebuoy", "lux", "nivea", "kahf", "garnier",
+    "ponds", "pond s", "maybelline", "wardah", "kahf", "abc",
+    "bango", "ciptadent", "sunlight", "wong coco", "markenburg",
+    "mellow puff", "sasa", "bango", "mujigae", "lotte milkis",
+    "royal canin", "whiskas", "drypers", "popok sweety",
+]
+_BRAND_SIGNATURES = sorted(
+    {re.sub(r"[^a-z0-9]+", " ", value.casefold()).strip() for value in _BRAND_PHRASES},
+    key=lambda value: (-len(value.split()), -len(value)),
+)
+
+def product_name_brand_signature(value: object) -> str:
+    """Return a curated brand signature, or empty when brand cannot be identified.
+
+    The matcher searches a controlled list of recognizable brands and store labels.
+    It never guesses a brand from the first word, because that often mistakes product
+    types (e.g. 'Susu', 'Minyak', 'Air') for brands.
+    """
+    text = _fuzzy_text(value)
+    if not text:
+        return ""
+    tokens = text.split()
+    for phrase in _BRAND_SIGNATURES:
+        parts = phrase.split()
+        width = len(parts)
+        if any(tokens[index:index + width] == parts for index in range(len(tokens) - width + 1)):
+            return phrase
+    return ""
+
+
+_PACKAGING_MARKERS = {
+    "pouch": "pouch", "pch": "pouch", "refill": "refill",
+    "pet": "pet_bottle", "btl": "bottle", "botol": "bottle", "bottle": "bottle",
+    "sachet": "sachet", "sach": "sachet", "cup": "cup",
+    "jar": "jar", "kaleng": "can", "can": "can", "tube": "tube",
+}
+
+def product_name_packaging_signature(value: object) -> str:
+    """Return explicit package type when present; absence is unknown, not equal."""
+    tokens = _fuzzy_text(value).split()
+    for token in tokens:
+        if token in _PACKAGING_MARKERS:
+            return _PACKAGING_MARKERS[token]
+    return ""
+
+
+def product_name_packaging_match(a: object, b: object) -> bool | None:
+    left = product_name_packaging_signature(a)
+    right = product_name_packaging_signature(b)
+    if not left or not right:
+        return None
+    return left == right
+
+
+def product_name_brand_match(a: object, b: object) -> bool | None:
+    """True for equal known brands, False for conflicting known brands, else None."""
+    left = product_name_brand_signature(a)
+    right = product_name_brand_signature(b)
+    if not left or not right:
+        return None
+    return left == right
+
+
 def product_name_identity_warnings(a: object, b: object) -> list[str]:
     """Return explicit conflicts that should prevent auto-merging names."""
     warnings = []
@@ -263,6 +343,12 @@ def product_name_identity_warnings(a: object, b: object) -> list[str]:
     va, vb = product_name_variant_signature(a), product_name_variant_signature(b)
     if va and vb and va != vb:
         warnings.append("varian rasa/aroma/formula berbeda")
+    brand_match = product_name_brand_match(a, b)
+    if brand_match is False:
+        warnings.append("merek berbeda")
+    packaging_match = product_name_packaging_match(a, b)
+    if packaging_match is False:
+        warnings.append("jenis kemasan berbeda")
     return warnings
 
 
@@ -338,8 +424,20 @@ def product_name_package_match_signature(value: object) -> tuple[str, ...]:
 
     Compatible units are normalized (1.8 L == 1800 ml; 1 kg == 1000 g), but
     multipack counts and dimensions are retained to avoid equating different SKUs.
+    Slash-separated alternative sizes (e.g. 920 / 950 g) are treated as ambiguous
+    and cannot match a single-size reference automatically.
     """
     text = clean_product_name(value).casefold()
+    alternative = re.search(
+        r"\b(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*"
+        r"(ml|milli\s*liter|gr?\.?|grams?|kg|kilograms?|litre|liter|ltr|l)\b",
+        text, re.IGNORECASE,
+    )
+    if alternative:
+        left, right, unit = alternative.groups()
+        return (
+            "alternatives:" + _canonical_measure(left, unit) + "|" + _canonical_measure(right, unit),
+        )
     pack = _MATCH_PACK_RE.search(text)
     if pack:
         count, amount, unit = pack.groups()
@@ -378,7 +476,9 @@ def load_product_name_aliases(path: str | Path) -> dict[str, str]:
     """Load only explicitly approved aliases with identical package signatures.
 
     The CSV is intentionally empty by default. Adding an alias is a manual data
-    curation action; aliases with different sizes or variant markers are ignored.
+    curation action; aliases with different brands, sizes, variants, or explicit
+    package types are ignored. New review imports require evidence for unknown brands.
+    The legacy `note` column remains readable for previously curated files.
     """
     alias_path = Path(path)
     if not alias_path.is_file():
@@ -404,6 +504,24 @@ def load_product_name_aliases(path: str | Path) -> dict[str, str]:
             continue
         if product_name_variant_signature(alias) != product_name_variant_signature(canonical):
             continue
+        # Known brand conflicts are never allowed. If the brand cannot be inferred
+        # from the names, require explicit reviewer evidence and a direct product URL.
+        brand_match = product_name_brand_match(alias, canonical)
+        if brand_match is False:
+            continue
+        if product_name_packaging_match(alias, canonical) is False:
+            continue
+        if brand_match is None:
+            evidence_url = str(row.get("evidence_url") or "").strip()
+            # Backward compatibility: old curated alias files used the `note`
+            # column. The importer for new approvals still requires both a note
+            # and direct evidence URL when a brand cannot be inferred.
+            evidence_note = str(row.get("verification_note") or row.get("note") or "").strip()
+            parsed = urlparse(evidence_url) if evidence_url else None
+            if not evidence_note:
+                continue
+            if evidence_url and not (parsed and parsed.scheme in {"http", "https"} and parsed.hostname):
+                continue
         proposed.setdefault(alias_key, set()).add(canonical_key)
         raw_values[alias_key] = (alias, canonical)
     # Conflicting aliases are intentionally not applied.
@@ -428,6 +546,12 @@ def _self_test() -> None:
     assert product_name_similarity("Aice Mochi Vanilla Chocolate 270 g", "Aice Mochi Vanilla / Chocolate 270 g") >= 0.99
     assert product_names_can_auto_merge("Aice Mochi Vanilla Chocolate 270 g", "Aice Mochi Vanilla / Chocolate 270 g")
     assert not product_names_can_auto_merge("Aice Mochi Vanilla 270 g", "Aice Mochi Chocolate 270 g")
+    assert product_name_brand_match("Bimoli Minyak Goreng 2 L", "Bimoli Minyak Goreng 2000 ml") is True
+    assert product_name_brand_match("Bimoli Minyak Goreng 2 L", "Sania Minyak Goreng 2 L") is False
+    assert product_name_brand_match("Le Minerale Air Mineral 600 ml", "Nestle Air Mineral 600 ml") is False
+    assert product_name_brand_match("Produk Tanpa Brand 100 g", "Item Tanpa Brand 100 g") is None
+    assert product_name_package_match_signature("Bango Kecap 920 / 950 g") != product_name_package_match_signature("Bango Kecap 950 g")
+    assert product_name_packaging_match("Tropical PET 2 L", "Tropical Pouch 2 L") is False
     assert not product_names_can_auto_merge("Sunlight Jeruk 755 ml", "Sunlight Jeruk 450 ml")
     print("SELF-TEST PASSED: normalisasi nama, ukuran, varian, dan fuzzy matching.")
 

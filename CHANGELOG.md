@@ -1,4 +1,14 @@
 # Changelog
+## v12 — Human-reviewed SKU matching & catalogue workflow
+- Add `output/Review_Kandidat_SKU.xlsx` as a manual workflow for fuzzy SKU suggestions. Candidate classification now checks curated brand identity, exact normalized package size, variant markers, explicit package type, merchant scope and reference age.
+- Reject known brand conflicts, alternative/ambiguous package sizes, different variants and conflicting package types. Every other candidate remains manual-review only; no fuzzy candidate can attach a price automatically.
+- Distinguish same-merchant evidence from cross-merchant market-reference-only candidates. Manual alias approval is recorded only after reviewer decision; unknown brands require a direct identity-evidence URL and reviewer note.
+- Preserve reviewer decisions on workbook rebuilds while candidate identity (including current price/date/source URL) remains unchanged. Importer supports old `note` alias CSVs and writes the expanded `verification_note`/`evidence_url` format.
+- Separate the daily catalogue into mutually exclusive fresh-clean, fresh-review, carried-forward, and review-only buckets. Reconcile `Mulai Di Sini` totals against these tabs; concise CSV output includes only fresh-clean offers.
+- Keep eligible price-search candidates outside the main catalogue in a separate `Di Luar Katalog` sheet instead of dropping them. Existing manual fields in this sheet survive regeneration; these rows are review-only and are not imported automatically.
+- Add launcher modes `--export-sku-review` and `--import-sku-review`; rebuild and normal pipeline refresh the review workbook. Fix legacy batch rebuild flow and duplicate/incorrect jump labels.
+- Add regression coverage for brand, unit/package, variant and packaging conflicts; cross-merchant scope; stale references; alias approval/rejection; candidate workbook decision persistence; fresh/preserved sheet partitions; out-of-catalog price-search persistence; and launcher routing.
+
 
 ## v11 — Smart SKU matching & review-only candidates
 - Add canonical physical-unit matching for exact SKU references (e.g. 1.8 L and 1800 ml; 1 kg and 1000 g) while preserving multipack structure so 2 x 500 ml never collapses to 1 L.

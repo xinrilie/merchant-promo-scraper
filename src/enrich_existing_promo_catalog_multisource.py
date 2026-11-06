@@ -257,6 +257,19 @@ def freshness_display_label(status):
     return FRESHNESS_DISPLAY_LABELS.get(status, FRESHNESS_DISPLAY_LABELS["historical_or_unverified"])
 
 
+def row_is_carried_forward(row):
+    """True only when the offer has no fresh source attribution in this run."""
+    if truthy(row.get("retained_from_previous_run")):
+        return True
+    status = str(row.get("freshness_status") or "").strip().casefold()
+    if status == "preserved_previous":
+        return True
+    if status.startswith("mixed:"):
+        values = set(status.partition(":")[2].split("|"))
+        return "preserved_previous" in values and "fresh" not in values
+    return False
+
+
 def latest_scrape_timestamp(rows):
     parsed_values = []
     for row in rows:
@@ -3210,6 +3223,8 @@ SIMPLE_EXCEL_COLUMNS = [
     "Status Diskon",
     "Penawaran",
     "Status Promo",
+    "Kesegaran Data",
+    "Status Pemeriksaan",
     "Verifikasi Sumber",
     "Sumber URL",
 ]
@@ -3580,8 +3595,20 @@ def make_simple_excel_row(row):
         "Status Diskon": discount_status or "Belum bisa dihitung",
         "Penawaran": offer or "—",
         "Status Promo": display_status(row),
+        "Kesegaran Data": freshness_display_label(
+            row.get("freshness_status") or classify_row_freshness(row.get("scraped_at"), row.get("retained_from_previous_run"))
+        ),
+        "Status Pemeriksaan": "Perlu review" if (
+            not isinstance(discount_cell, (int, float))
+            or bool(row.get("price_quality_flag"))
+            or row.get("product_validation_status") == "review"
+            or row.get("promo_status") in {"active_estimated", "upcoming_estimated", "unknown"}
+            or bool(row.get("period_flags"))
+            or bool(row.get("overlap_period_flag"))
+        ) else "Lolos review tambahan",
         "Verifikasi Sumber": row.get("source_verification_label") or source_verification_label(row.get("verification_status")),
         "Sumber URL": clean.get("Sumber URL") or "",
+        "_carried_forward": row_is_carried_forward(row),
         "_discount_numeric": isinstance(discount_cell, (int, float)),
         "_discount_basis": calculation_basis or existing_basis,
         "_review_required": (
@@ -3622,6 +3649,8 @@ def _write_simple_worksheet(wb, name, rows, header_fill, title_fill=None):
         "Status Diskon": 48,
         "Penawaran": 48,
         "Status Promo": 22,
+        "Kesegaran Data": 30,
+        "Status Pemeriksaan": 26,
         "Verifikasi Sumber": 35,
         "Sumber URL": 62,
     }
@@ -3633,8 +3662,8 @@ def _write_simple_worksheet(wb, name, rows, header_fill, title_fill=None):
             cell.alignment = Alignment(
                 vertical="top",
                 wrap_text=header in {
-                    "Nama Produk", "Kategori", "Status Diskon",
-                    "Penawaran", "Verifikasi Sumber", "Sumber URL",
+                    "Nama Produk", "Kategori", "Status Diskon", "Kesegaran Data",
+                    "Status Pemeriksaan", "Penawaran", "Verifikasi Sumber", "Sumber URL",
                 },
             )
             if header in {"Harga Normal/Acuan (Rp)", "Harga Promo (Rp)", "Hemat (Rp)"}:
@@ -3675,7 +3704,10 @@ def write_simple_catalog_csv(path, rows, *, active_only=False):
     """Write a CSV whose columns and display values mirror the Excel Promo sheet."""
     simple_rows = build_simple_catalog_rows(rows)
     if active_only:
-        simple_rows = [row for row in simple_rows if not row.get("_review_required")]
+        simple_rows = [
+            row for row in simple_rows
+            if not row.get("_review_required") and not row.get("_carried_forward")
+        ]
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SIMPLE_EXCEL_COLUMNS, extrasaction="ignore")
@@ -3692,17 +3724,6 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
     simple_current = build_simple_catalog_rows(current_rows)
     simple_review = build_simple_catalog_rows(review_rows)
 
-    active_keys = {
-        (
-            str(row.get("Nama Produk", "")).casefold(),
-            str(row.get("Merchant", "")).casefold(),
-            str(row.get("Masa Berlaku", "")),
-            str(row.get("Penawaran", "")),
-            str(row.get("Sumber URL", "")),
-        )
-        for row in simple_current
-    }
-
     def simple_key(row):
         return (
             str(row.get("Nama Produk", "")).casefold(),
@@ -3713,13 +3734,15 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
         )
 
     active_keys = {simple_key(row) for row in simple_current}
-    active_review = [row for row in simple_current if row.get("_review_required")]
-    clean_current = [row for row in simple_current if not row.get("_review_required")]
+    # Old-but-still-retained active offers are deliberately separated from the
+    # fresh catalogue. They remain visible, but cannot inflate the fresh Promo tab.
+    preserved_current = [row for row in simple_current if row.get("_carried_forward")]
+    fresh_current = [row for row in simple_current if not row.get("_carried_forward")]
+    active_review = [row for row in fresh_current if row.get("_review_required")]
+    clean_current = [row for row in fresh_current if not row.get("_review_required")]
 
-    # Keep the three everyday tabs mutually exclusive. Promo Aktif - Review is
-    # a separate bucket for offers that are currently active but still need a
-    # manual check; Perlu Diperiksa contains review-only rows outside the active
-    # catalog. This avoids counting the same offer twice across the main tabs.
+    # Main tabs are mutually exclusive: fresh clean, fresh-needs-review,
+    # carried-forward, and review-only outside the active snapshot.
     review_only = []
     seen_review = set()
     for row in simple_review:
@@ -3728,10 +3751,12 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
             continue
         seen_review.add(key)
         review_only.append(row)
-    combined_review = active_review + review_only
+    preserved_review = [row for row in preserved_current if row.get("_review_required")]
+    combined_review = active_review + preserved_review + review_only
 
     _write_simple_worksheet(wb, "Promo", clean_current, header_fill, title_fill)
     _write_simple_worksheet(wb, "Promo Aktif - Review", active_review, header_fill, title_fill)
+    _write_simple_worksheet(wb, "Promo Dipertahankan", preserved_current, header_fill, title_fill)
     _write_simple_worksheet(wb, "Perlu Diperiksa", review_only, header_fill, title_fill)
 
     # Separate market-price opportunities from official discount claims.
@@ -3881,11 +3906,12 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
     summary_rows = [
         ["KATALOG PROMO", ""],
         ["Tanggal referensi", today_text],
-        ["Promo aktif tanpa review tambahan", len(clean_current)],
-        ["Promo aktif yang perlu review", len(active_review)],
-        ["Total promo aktif", len(simple_current)],
-        ["Baris perlu diperiksa di luar promo aktif", len(review_only)],
-        ["Total baris review unik", len(combined_review)],
+        ["Promo aktif terbaru tanpa review tambahan", len(clean_current)],
+        ["Promo aktif terbaru yang perlu review", len(active_review)],
+        ["Promo aktif dipertahankan dari run sebelumnya", len(preserved_current)],
+        ["Total promo aktif (terbaru + dipertahankan)", len(simple_current)],
+        ["Baris review di luar promo aktif", len(review_only)],
+        ["Total baris review unik (termasuk promo dipertahankan)", len(combined_review)],
         ["Diskon bisa dihitung", len(numeric_discounts)],
         ["Diskon belum bisa dihitung", not_calculated],
         ["Estimasi bundling (bukan diskon terkonfirmasi)", estimated_bundles],
@@ -3895,7 +3921,7 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
         ["Pembanding hanya satu domain (belum kuat)", single_market_source_count],
         ["Kandidat harga belum terverifikasi", len(candidate_records)],
         ["Kolom utama", "Nama Produk · Kategori · Merchant · Harga Normal/Acuan · Harga Promo · Hemat · Diskon · Masa Berlaku"],
-        ["Cara membaca", "Tab Promo hanya berisi promo aktif tanpa review tambahan. Promo aktif yang masih perlu diperiksa dipisahkan ke Promo Aktif - Review. Perlu Diperiksa berisi baris review di luar promo aktif, sehingga ketiga tab utama tidak saling menghitung ganda. Harga normal hanya diambil dari bukti teks; poster tidak dibaca dengan OCR."],
+        ["Cara membaca", "Promo berisi data fresh tanpa review tambahan. Promo Aktif - Review berisi data fresh yang masih perlu diperiksa. Promo Dipertahankan berisi penawaran aktif dari run sebelumnya dan tidak dianggap sebagai temuan terbaru. Perlu Diperiksa berisi baris review di luar snapshot aktif. Tab utama saling eksklusif. Harga normal hanya dari bukti teks; poster tidak dibaca dengan OCR."],
         ["Verifikasi", "Sumber agregator bukan verifikasi resmi retailer. Periksa sumber URL sebelum menganggap harga berlaku di semua toko/wilayah."],
         ["Riwayat", "Sheet audit teknis disimpan tersembunyi agar file utama sederhana. Data mentah dan log tetap ada di folder runtime."],
     ]
@@ -3917,7 +3943,7 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
     # Keep only useful daily tabs visible. Detailed audit sheets still exist for
     # project diagnostics and tests but do not clutter normal spreadsheet use.
     visible = {
-        "Ringkasan", "Promo", "Promo Aktif - Review", "Perlu Diperiksa",
+        "Ringkasan", "Promo", "Promo Aktif - Review", "Promo Dipertahankan", "Perlu Diperiksa",
         "Ringkasan Kategori", "Peluang Harga", "Kandidat Harga", "Referensi Dikarantina",
     }
     for ws in wb.worksheets:
@@ -3932,11 +3958,18 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
     """User-facing workbook: clean catalogs plus separate review/duplicate/rejected audit sheets."""
     rejected_rows = rejected_rows or []
     quarantined_price_reference_rows = quarantined_price_reference_rows or []
-    clean_active_rows, review_active_rows, review_nonactive_rows = partition_current_review_rows(
+    clean_active_all_rows, review_active_all_rows, review_nonactive_rows = partition_current_review_rows(
         current_rows, review_rows
     )
-    review_active_ids = {id(row) for row in review_active_rows}
-    clean_confirmed_rows = [row for row in confirmed_rows if id(row) not in review_active_ids]
+    preserved_active_rows = [row for row in current_rows if row_is_carried_forward(row)]
+    preserved_ids = {id(row) for row in preserved_active_rows}
+    clean_active_rows = [row for row in clean_active_all_rows if id(row) not in preserved_ids]
+    review_active_rows = [row for row in review_active_all_rows if id(row) not in preserved_ids]
+    review_preserved_rows = [row for row in review_active_all_rows if id(row) in preserved_ids]
+    clean_confirmed_rows = [
+        row for row in confirmed_rows
+        if id(row) not in {id(item) for item in review_active_all_rows} and id(row) not in preserved_ids
+    ]
     try:
         from openpyxl import Workbook
         from openpyxl.styles import Alignment, Font, PatternFill
@@ -3955,13 +3988,15 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
     summary = [
         ["KATALOG PROMO MULTI-SUMBER", ""],
         ["Tanggal acuan", TODAY.isoformat()],
-        ["Promo aktif tanpa review tambahan", len(clean_active_rows)],
-        ["Promo aktif yang perlu review", len(review_active_rows)],
-        ["Total promo aktif (dua baris di atas)", len(current_rows)],
-        ["Catatan pembagian sheet", "Promo dan Promo Aktif - Review saling eksklusif. Perlu Diperiksa hanya berisi baris review di luar promo aktif. Tab review aktif dipisah agar tidak dihitung dua kali sebagai total promo harian."],
-        ["Promo aktif dengan periode pasti dan tanpa review tambahan", len(clean_confirmed_rows)],
+        ["Promo fresh tanpa review tambahan", len(clean_active_rows)],
+        ["Promo fresh yang perlu review", len(review_active_rows)],
+        ["Promo aktif dipertahankan dari run sebelumnya", len(preserved_active_rows)],
+        ["Total promo aktif (fresh + dipertahankan)", len(current_rows)],
+        ["Catatan pembagian sheet", "Promo dan Promo Aktif - Review hanya berisi temuan fresh. Promo Dipertahankan memuat penawaran aktif dari run sebelumnya. Perlu Diperiksa hanya berisi review di luar snapshot aktif. Keempat tab ini saling eksklusif."],
+        ["Promo fresh dengan periode pasti dan tanpa review tambahan", len(clean_confirmed_rows)],
         ["Baris review di luar promo aktif", len(review_nonactive_rows)],
-        ["Total baris review (termasuk promo aktif yang perlu review)", len(review_rows)],
+        ["Baris promo dipertahankan yang juga perlu review", len(review_preserved_rows)],
+        ["Total baris review (fresh/preserved aktif + di luar aktif)", len(review_rows)],
         ["Referensi harga dikarantina karena merchant tidak sesuai cakupan URL Hemat", len(quarantined_price_reference_rows)],
         ["Kandidat non-produk ditolak", len(rejected_rows)],
         ["Kelompok variasi nama produk", len(name_variant_rows)],
@@ -3973,7 +4008,7 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
         ["Status Validasi Produk", "Kolom ini terpisah dari Status Promo. 'Valid' berarti identitas produk dan pemeriksaan harga/merchant lolos gerbang; 'Perlu review' berarti perlu pemeriksaan, meskipun tanggal promo masih berstatus Aktif."],
         ["Sumber produk", "Hemat.id, Katalogpromosi.com, dan Scanharga.com"],
         ["Catatan", "Kepastian periode dipisahkan dari verifikasi sumber; agregator dan artikel publik bukan verifikasi resmi retailer."],
-        ["Petunjuk", f"Buka sheet Promo untuk daftar promo sehari-hari. Gunakan filter Kategori Produk dan Subkategori untuk mencari jenis barang. Ringkasan Kategori menunjukkan jumlah promo aktif per kategori; Referensi Kategori berisi daftar {len(CATEGORY_TAXONOMY)} kategori. Daftar Filter Produk mengulang daftar contoh klasifikasi yang disimpan di config/category_review_list.csv."],
+        ["Petunjuk", f"Buka sheet Promo untuk temuan fresh tanpa review; Promo Aktif - Review untuk temuan fresh yang perlu dicek; Promo Dipertahankan untuk data lama yang masih masuk snapshot; Perlu Diperiksa untuk review di luar snapshot aktif. Gunakan filter Kategori Produk dan Subkategori. Referensi Kategori memuat {len(CATEGORY_TAXONOMY)} kategori."],
         ["File teknis", "Data mentah dan log tersimpan di folder runtime; laporan gerbang ekspor ada di promo_export_quality_gate_report.json."],
     ]
     for row in summary:
@@ -4080,8 +4115,10 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
     sheets = [
         ("Aktif", clean_active_rows, False),
         ("Aktif - Review", review_active_rows, True),
+        ("Aktif - Dipertahankan", preserved_active_rows, False),
         ("Periode Pasti", clean_confirmed_rows, False),
         ("Perlu Review", review_nonactive_rows, True),
+        ("Aktif - Semua (Audit)", current_rows, False),
     ]
     for sheet_name, rows, is_review in sheets:
         ws = wb.create_sheet(sheet_name)

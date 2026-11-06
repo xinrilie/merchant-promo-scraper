@@ -90,3 +90,81 @@ def test_generated_manual_workbook_contains_tokku_verification_fields(tmp_path, 
         assert "Tidak ada collector otomatis Tokku" in help_text
     finally:
         wb.close()
+
+
+def test_outside_catalog_candidates_are_kept_in_separate_review_sheet(tmp_path, monkeypatch):
+    from openpyxl import load_workbook
+    source = tmp_path / "products.csv"
+    catalog = tmp_path / "catalog.csv"
+    output = tmp_path / "Daftar_Cari_Harga_Manual.xlsx"
+    _write_csv(source, [
+        {"product_text": "Sania Minyak Goreng 2 L", "promo_price": "45000", "normal_price": "", "merchant_name": "Shop A", "product_validation_status": "eligible", "source_url": "https://example.test/a"},
+        {"product_text": "Bango Kecap Manis 700 g", "promo_price": "19000", "normal_price": "", "merchant_name": "Shop B", "product_validation_status": "eligible", "source_url": "https://example.test/b"},
+    ])
+    _write_csv(catalog, [{"Nama Produk": "Sania Minyak Goreng 2 L"}])
+    monkeypatch.setattr(exporter, "SOURCE", source)
+    monkeypatch.setattr(exporter, "CATALOG_CANDIDATES", (catalog,))
+    monkeypatch.setattr(exporter, "OUT", output)
+
+    exporter.main()
+    wb = load_workbook(output, read_only=True, data_only=True)
+    try:
+        assert wb["Cari Harga"].max_row == 2
+        assert wb["Di Luar Katalog"].max_row == 2
+        headers = [cell.value for cell in wb["Di Luar Katalog"][1]]
+        row = dict(zip(headers, next(wb["Di Luar Katalog"].iter_rows(min_row=2, values_only=True))))
+        assert row["Nama Produk"] == "Bango Kecap Manis 700 g"
+        assert row["Status"] == "DI LUAR KATALOG - REVIEW"
+        assert "tidak masuk katalog utama" in row["Catatan Verifikasi"]
+    finally:
+        wb.close()
+
+
+def test_manual_values_in_outside_catalog_sheet_survive_rebuild(tmp_path, monkeypatch):
+    from openpyxl import Workbook, load_workbook
+    source = tmp_path / "products.csv"
+    catalog = tmp_path / "catalog.csv"
+    output = tmp_path / "Daftar_Cari_Harga_Manual.xlsx"
+    source_rows = [{
+        "product_text": "Bango Kecap Manis 700 g", "promo_price": "19000", "normal_price": "",
+        "merchant_name": "Shop B", "product_validation_status": "eligible", "source_url": "https://example.test/b",
+    }]
+    _write_csv(source, source_rows)
+    _write_csv(catalog, [{"Nama Produk": "Sania Minyak Goreng 2 L"}])
+    monkeypatch.setattr(exporter, "SOURCE", source)
+    monkeypatch.setattr(exporter, "CATALOG_CANDIDATES", (catalog,))
+    monkeypatch.setattr(exporter, "OUT", output)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Cari Harga"
+    ws.append(exporter.HEADERS)
+    outside = wb.create_sheet("Di Luar Katalog")
+    outside.append(exporter.HEADERS)
+    values = {header: "" for header in exporter.HEADERS}
+    values.update({
+        "Nama Produk": "Bango Kecap Manis 700 g",
+        "Merchant Promo": "Shop B",
+        "Harga Promo (Rp)": "19000",
+        "Harga Referensi (Rp) - isi manual": "23000",
+        "Nama Sumber": "Tokku",
+        "URL Halaman Harga": "https://tokku.app/id/product/bango-example",
+        "Bukti Harga pada Halaman": "Harga normal retailer Rp23.000",
+        "Tanggal Cek (YYYY-MM-DD)": "2026-11-04",
+        "Status": "DI LUAR KATALOG - REVIEW",
+    })
+    outside.append([values.get(header, "") for header in exporter.HEADERS])
+    wb.save(output)
+    wb.close()
+
+    exporter.main()
+    wb = load_workbook(output, read_only=True, data_only=True)
+    try:
+        ws = wb["Di Luar Katalog"]
+        headers = [cell.value for cell in ws[1]]
+        row = dict(zip(headers, next(ws.iter_rows(min_row=2, values_only=True))))
+        assert row["Harga Referensi (Rp) - isi manual"] == "23000"
+        assert row["Nama Sumber"] == "Tokku"
+        assert row["URL Halaman Harga"] == "https://tokku.app/id/product/bango-example"
+    finally:
+        wb.close()
