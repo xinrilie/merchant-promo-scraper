@@ -57,8 +57,7 @@ MAX_ARTICLES_PER_SOURCE = 30
 MAX_IMAGES_PER_ARTICLE = 20
 
 OUT_ALL = RUNTIME_DIR / "promo_multisource_products_all.csv"
-OUT_ACTIVE = RUNTIME_DIR / "promo_multisource_products_active.csv"
-OUT_REVIEW = RUNTIME_DIR / "promo_multisource_products_review.csv"
+OBSOLETE_SPLIT_SNAPSHOTS = ("promo_multisource_products_active.csv", "promo_multisource_products_review.csv")
 OUT_ARTICLES = RUNTIME_DIR / "promo_multisource_articles.csv"
 OUT_IMAGES = RUNTIME_DIR / "promo_multisource_catalog_images.csv"
 OUT_LOG = RUNTIME_DIR / "promo_multisource_runlog.json"
@@ -1802,7 +1801,7 @@ def main() -> None:
             "image_references_found": len(all_images),
             "rejected_non_product_candidates": len(REJECTED_PRODUCT_CANDIDATES),
             "rejection_reasons": dict(Counter(x.get("rejection_reason", "unknown") for x in REJECTED_PRODUCT_CANDIDATES)),
-            "output_files": [OUT_ALL.name, OUT_ACTIVE.name, OUT_REVIEW.name, OUT_ARTICLES.name, OUT_IMAGES.name, OUT_REJECTED_CANDIDATES.name, OUT_LOG.name, OUT_HISTORY.name],
+            "output_files": [OUT_ALL.name, OUT_ARTICLES.name, OUT_IMAGES.name, OUT_REJECTED_CANDIDATES.name, OUT_LOG.name, OUT_HISTORY.name],
             "limitations": [
                 "Data aggregator diberi verification_status=aggregator_only; bukan verifikasi resmi retailer.",
                 "URL poster/gambar promo dicatat di promo_multisource_catalog_images.csv sebagai referensi visual; gambar tidak diunduh untuk membaca teks atau harga.",
@@ -1821,9 +1820,16 @@ def main() -> None:
                 "Snapshot katalog sebelumnya dipertahankan; periksa runtime/source_health dan output/Riwayat_Promo.csv."
             )
 
+        # The complete snapshot already contains promo_status and review_reason.
+        # Separate active/review CSVs duplicated this dataset and were not consumed
+        # by the pipeline; keep only the canonical all-products snapshot.
         write_csv(OUT_ALL, products, PRODUCT_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id", "review_reason"])
-        write_csv(OUT_ACTIVE, active, ACTIVE_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id"])
-        write_csv(OUT_REVIEW, review, REVIEW_FIELDS + ["source_urls", "source_names", "duplicate_count", "cross_source_duplicate", "duplicate_group_id"])
+        for obsolete_name in OBSOLETE_SPLIT_SNAPSHOTS:
+            obsolete_path = RUNTIME_DIR / obsolete_name
+            try:
+                obsolete_path.unlink(missing_ok=True)
+            except OSError as exc:
+                say(f"Peringatan: file snapshot duplikat lama tidak dapat dihapus ({obsolete_path.name}): {exc}")
         write_csv(OUT_ARTICLES, all_articles, ARTICLE_FIELDS)
         write_csv(OUT_IMAGES, all_images, IMAGE_FIELDS)
         write_csv(OUT_REJECTED_CANDIDATES, REJECTED_PRODUCT_CANDIDATES, [

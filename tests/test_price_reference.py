@@ -557,3 +557,59 @@ def test_apply_price_reference_uses_unit_normalized_exact_sku_for_reference_disc
     assert row["discount_percent"] == 25.0
     assert row["reference_price_identity_match_method"] == "exact_unit_normalized"
     assert summary["unit_normalized_exact_matches"] == 1
+
+
+def test_prepared_reference_index_returns_same_exact_match_as_direct_lookup():
+    from promo_price_reference import prepare_reference_lookup_index
+
+    refs = [
+        _reference_dict(
+            product_text="Ultra Milk UHT Cokelat 1 L",
+            merchant_name="Indomaret",
+            normal_price="21000",
+            observed_at=TODAY.isoformat(),
+        ),
+        _reference_dict(
+            product_text="Ultra Milk UHT Full Cream 1 L",
+            merchant_name="Indomaret",
+            normal_price="20000",
+            observed_at=TODAY.isoformat(),
+        ),
+    ]
+    index = prepare_reference_lookup_index(refs)
+    direct = find_reference_price(refs, "Ultra Milk UHT Cokelat 1000 ml", "Indomaret", TODAY)
+    prepared = find_reference_price(
+        refs, "Ultra Milk UHT Cokelat 1000 ml", "Indomaret", TODAY,
+        prepared_index=index,
+    )
+    assert prepared == direct
+    assert prepared["status"] == "matched_recent_exact"
+    assert prepared["normal_price"] == 21000
+
+
+def test_prepared_reference_candidate_index_keeps_fuzzy_suggestions_review_only():
+    from promo_price_reference import prepare_reference_candidate_index, suggest_reference_price_candidates
+
+    refs = [
+        _reference_dict(
+            product_text="Sari Roti Tawar Kupas 350 g",
+            merchant_name="Indomaret",
+            normal_price="18000",
+            observed_at=TODAY.isoformat(),
+        ),
+        _reference_dict(
+            product_text="Sari Roti Tawar Gandum 350 g",
+            merchant_name="Indomaret",
+            normal_price="19000",
+            observed_at=TODAY.isoformat(),
+        ),
+    ]
+    index = prepare_reference_candidate_index(refs)
+    prepared = suggest_reference_price_candidates(
+        refs, "Sari Roti Tawar Kupas Premium 350 g", "Indomaret", prepared_index=index
+    )
+    fallback = suggest_reference_price_candidates(
+        refs, "Sari Roti Tawar Kupas Premium 350 g", "Indomaret"
+    )
+    assert prepared == fallback
+    assert all(row["automatic_match_allowed"] == "no" for row in prepared)

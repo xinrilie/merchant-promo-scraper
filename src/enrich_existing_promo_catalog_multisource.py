@@ -11,6 +11,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from urllib.parse import urlparse
 import math
+import time
 
 from promo_names import (
     clean_product_name, name_variants, product_name_similarity,
@@ -34,7 +35,7 @@ from promo_campaign_utils import (
 from promo_price_reference import (
     PRICE_REFERENCE_MAX_AGE_DAYS, REFERENCE_FIELDS, load_reference_database, update_reference_database,
     find_reference_price, EXPLICIT_NORMAL_PRICE_LABEL_RE, merchant_key,
-    prepare_reference_candidate_index, suggest_reference_price_candidates, write_price_match_candidates,
+    prepare_reference_lookup_index, suggest_reference_price_candidates, write_price_match_candidates,
 )
 from promo_market_prices import (
     MARKET_REFERENCE_CSV, initialize_market_reference_database,
@@ -50,8 +51,6 @@ OUTPUT_DIR = ROOT_DIR / "output"
 MULTISOURCE_CSV = RUNTIME_DIR / "promo_multisource_products_all.csv"  # hasil collector tiga sumber aktif
 MULTISOURCE_RUN_LOG = RUNTIME_DIR / "promo_multisource_runlog.json"
 OUT_ACTIVE = OUTPUT_DIR / "Katalog_Promo_Final.csv"
-OUT_CONFIRMED = RUNTIME_DIR / "promo_catalog_multisource_confirmed.csv"
-OUT_REVIEW = RUNTIME_DIR / "promo_catalog_multisource_review.csv"
 OUT_FULL = RUNTIME_DIR / "promo_catalog_multisource_full_audit.csv"
 OUT_REPORT = RUNTIME_DIR / "promo_catalog_multisource_quality_report.json"
 OUT_GATE_REPORT = RUNTIME_DIR / "promo_export_quality_gate_report.json"
@@ -2047,7 +2046,7 @@ def apply_price_reference(
     match_diagnostics = Counter()
     candidate_rows = []
     candidate_query_keys = set()
-    candidate_index = prepare_reference_candidate_index(references) if candidate_output_path else None
+    candidate_index = prepare_reference_lookup_index(references, aliases=aliases)
     for row in rows:
         row.setdefault("reference_normal_price", None)
         row.setdefault("reference_price_source_name", None)
@@ -2104,7 +2103,7 @@ def apply_price_reference(
         ref = find_reference_price(
             references, row.get("product_text"), row.get("merchant_name"), today,
             max_age_days=max_age_days, region_or_channel=row.get("region_or_channel"),
-            aliases=aliases,
+            aliases=aliases, prepared_index=candidate_index,
         )
         row["reference_price_match_status"] = ref.get("status", "no_exact_match")
         row["reference_price_match_diagnostic"] = ref.get("diagnostic") or ref.get("status", "no_exact_match")
@@ -3656,16 +3655,16 @@ def _write_simple_worksheet(wb, name, rows, header_fill, title_fill=None):
     }
     for col_idx, header in enumerate(SIMPLE_EXCEL_COLUMNS, start=1):
         ws.column_dimensions[get_column_letter(col_idx)].width = widths.get(header, 20)
-    for row_idx in range(2, ws.max_row + 1):
-        for col_idx, header in enumerate(SIMPLE_EXCEL_COLUMNS, start=1):
-            cell = ws.cell(row_idx, col_idx)
-            cell.alignment = Alignment(
-                vertical="top",
-                wrap_text=header in {
-                    "Nama Produk", "Kategori", "Status Diskon", "Kesegaran Data",
-                    "Status Pemeriksaan", "Penawaran", "Verifikasi Sumber", "Sumber URL",
-                },
-            )
+    wrap_headers = {
+        "Nama Produk", "Kategori", "Status Diskon", "Kesegaran Data",
+        "Status Pemeriksaan", "Penawaran", "Verifikasi Sumber", "Sumber URL",
+    }
+    top_alignment = Alignment(vertical="top")
+    wrap_alignment = Alignment(vertical="top", wrap_text=True)
+    for row_cells in ws.iter_rows(min_row=2):
+        for cell in row_cells:
+            header = SIMPLE_EXCEL_COLUMNS[cell.column - 1]
+            cell.alignment = wrap_alignment if header in wrap_headers else top_alignment
             if header in {"Harga Normal/Acuan (Rp)", "Harga Promo (Rp)", "Hemat (Rp)"}:
                 if isinstance(cell.value, (int, float)):
                     cell.number_format = '"Rp" #,##0'
@@ -3802,10 +3801,13 @@ def _build_simple_workbook_sheets(wb, current_rows, review_rows, header_fill, ti
     market_widths = [42, 22, 18, 23, 24, 23, 20, 16, 42, 52, 72, 24, 20]
     for col_idx, width in enumerate(market_widths, start=1):
         market_sheet.column_dimensions[get_column_letter(col_idx)].width = width
-    for row_idx in range(2, market_sheet.max_row + 1):
-        for col_idx, header in enumerate(market_headers, start=1):
-            cell = market_sheet.cell(row_idx, col_idx)
-            cell.alignment = Alignment(vertical="top", wrap_text=header in {"Nama Produk", "Status Pembanding", "Harga per Domain / Jenis Harga", "URL Bukti Harga"})
+    market_wrap_fields = {"Nama Produk", "Status Pembanding", "Harga per Domain / Jenis Harga", "URL Bukti Harga"}
+    market_top_alignment = Alignment(vertical="top")
+    market_wrap_alignment = Alignment(vertical="top", wrap_text=True)
+    for row_cells in market_sheet.iter_rows(min_row=2):
+        for cell in row_cells:
+            header = market_headers[cell.column - 1]
+            cell.alignment = market_wrap_alignment if header in market_wrap_fields else market_top_alignment
             if header in {"Harga Promo (Rp)", "Median Harga Pasar (Rp)", "Potensi Selisih (Rp)"} and isinstance(cell.value, (int, float)):
                 cell.number_format = '"Rp" #,##0'
             elif header == "Lebih Murah dari Median (%)" and isinstance(cell.value, (int, float)):
@@ -4118,7 +4120,6 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
         ("Aktif - Dipertahankan", preserved_active_rows, False),
         ("Periode Pasti", clean_confirmed_rows, False),
         ("Perlu Review", review_nonactive_rows, True),
-        ("Aktif - Semua (Audit)", current_rows, False),
     ]
     for sheet_name, rows, is_review in sheets:
         ws = wb.create_sheet(sheet_name)
@@ -4150,11 +4151,23 @@ def write_excel_catalog(path, current_rows, confirmed_rows, review_rows, name_va
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         for idx, width in enumerate(widths, start=1):
             ws.column_dimensions[get_column_letter(idx)].width = width
-            field = headers[idx - 1]
-            for col_cells in ws.iter_rows(min_row=2, min_col=idx, max_col=idx):
-                cell = col_cells[0]
-                cell.alignment = Alignment(vertical="top", wrap_text=field in {"Nama Produk", "Kategori Produk", "Subkategori", "Kesegaran Data", "Klaim Diskon Sumber (Review) (%)", "Detail Penawaran", "Kampanye", "Catatan", "Sumber URL", "URL Referensi Harga", "URL Pembanding Pasar", "Sumber Pembanding Pasar", "Dasar Diskon", "Sumber Referensi Harga", "Alasan Review"})
-                if field in {"Harga Asli (Rp)", "Harga Asli dari Sumber (Rp)", "Harga Normal Referensi (Rp)", "Harga Normal Estimasi Pasar (Rp)", "Harga Promo (Rp)", "Hemat / Selisih Referensi (Rp)"}:
+        wrap_fields = {
+            "Nama Produk", "Kategori Produk", "Subkategori", "Kesegaran Data",
+            "Klaim Diskon Sumber (Review) (%)", "Detail Penawaran", "Kampanye", "Catatan",
+            "Sumber URL", "URL Referensi Harga", "URL Pembanding Pasar",
+            "Sumber Pembanding Pasar", "Dasar Diskon", "Sumber Referensi Harga", "Alasan Review",
+        }
+        numeric_fields = {
+            "Harga Asli (Rp)", "Harga Asli dari Sumber (Rp)", "Harga Normal Referensi (Rp)",
+            "Harga Normal Estimasi Pasar (Rp)", "Harga Promo (Rp)", "Hemat / Selisih Referensi (Rp)",
+        }
+        top_alignment = Alignment(vertical="top")
+        wrap_alignment = Alignment(vertical="top", wrap_text=True)
+        for row_cells in ws.iter_rows(min_row=2):
+            for cell in row_cells:
+                field = headers[cell.column - 1]
+                cell.alignment = wrap_alignment if field in wrap_fields else top_alignment
+                if field in numeric_fields:
                     cell.number_format = '#,##0'
                 elif field == "Diskon (%)":
                     cell.number_format = '0.0"%"'
@@ -4734,6 +4747,7 @@ def partition_current_review_rows(current_rows, review_rows):
 
 
 def main():
+    pipeline_started = time.perf_counter()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     reference_init = initialize_price_reference_database()
@@ -4766,8 +4780,10 @@ def main():
     load_reference_database(PRICE_REFERENCE_CSV, diagnostics=quarantined_price_reference_rows)
     quarantined_reference_count = write_price_reference_quarantine(quarantined_price_reference_rows)
     all_quarantined_price_reference_rows = load_price_reference_quarantine()
+    reference_update_started = time.perf_counter()
     price_reference_update = update_reference_database(PRICE_REFERENCE_CSV, all_loaded_rows, TODAY)
     all_price_reference_records = load_reference_database(PRICE_REFERENCE_CSV)
+    print(f"Waktu pembaruan database harga: {time.perf_counter() - reference_update_started:.2f} detik", flush=True)
     price_reference_records = [r for r in all_price_reference_records if r.get("record_origin") != "user_supplied_estimate"]
     market_reference_init = initialize_market_reference_database(MARKET_REFERENCE_CSV)
     market_reference_records = load_market_reference_database(MARKET_REFERENCE_CSV)
@@ -4783,6 +4799,7 @@ def main():
     input_rows = [r for r in all_loaded_rows if r.get("product_validation_status") != "rejected"]
     # Fuzzy matching belongs here, after all source outputs are loaded and bad
     # non-product/article-headline rows are quarantined, but before final export.
+    matching_started = time.perf_counter()
     merged_raw = merge_rows(input_rows)
     merged_raw = mark_overlapping_offers(merged_raw)
     consolidated, consolidated_groups, consolidated_rows = consolidate_overlapping_offers(merged_raw)
@@ -4792,12 +4809,15 @@ def main():
         consolidated, price_reference_records, today=TODAY, aliases=product_name_aliases,
         candidate_output_path=OUT_PRICE_MATCH_CANDIDATES,
     )
+    print(f"Waktu pencocokan SKU + kandidat review: {time.perf_counter() - matching_started:.2f} detik", flush=True)
+    market_started = time.perf_counter()
     market_price_apply_summary = compare_market_prices(
         consolidated, market_reference_records, today=TODAY, aliases=product_name_aliases
     )
     estimated_normal_summary = estimate_normal_prices_from_references(
         consolidated, market_reference_records, today=TODAY, aliases=product_name_aliases
     )
+    print(f"Waktu pembandingan + estimasi harga pasar: {time.perf_counter() - market_started:.2f} detik", flush=True)
     print("Database harga pasar lokal:", MARKET_REFERENCE_CSV.relative_to(ROOT_DIR), f"({market_reference_init})")
     print("Estimasi harga normal pasar dari referensi manual:", estimated_normal_summary.get("rows_estimated", 0))
     print(" - Referensi Tokku manual:", estimated_normal_summary.get("tokku_estimates", 0))
@@ -4806,7 +4826,9 @@ def main():
     # Quality gate: a row can have an active period and still be unfit for the
     # public-facing catalog. Quarantine identity, merchant, category, source-link,
     # and unsupported-price problems before any user-facing file is overwritten.
+    gate_started = time.perf_counter()
     current, export_gate_report = apply_export_quality_gate(consolidated)
+    print(f"Waktu gerbang kualitas: {time.perf_counter() - gate_started:.2f} detik", flush=True)
     OUT_GATE_REPORT.write_text(json.dumps(export_gate_report, ensure_ascii=False, indent=2), encoding="utf-8")
     if export_gate_report.get("status") != "passed":
         raise RuntimeError(
@@ -4832,9 +4854,8 @@ def main():
 
     name_variant_rows = build_name_variant_rows(consolidated)
     possible_duplicate_rows = build_possible_duplicate_rows(current)
+    export_started = time.perf_counter()
     write_clean_rows(OUT_ACTIVE, current)
-    write_clean_rows(OUT_CONFIRMED, confirmed)
-    write_clean_rows(OUT_REVIEW, review, review=True)
     write_audit_rows(OUT_FULL, merged_raw)
     write_audit_rows(OUT_REJECTED_PRODUCTS, rejected_product_rows)
     write_possible_duplicate_csv(OUT_POSSIBLE_DUPES, possible_duplicate_rows)
@@ -4843,6 +4864,17 @@ def main():
         OUT_XLSX, current, confirmed, review, name_variant_rows, possible_duplicate_rows,
         rejected_product_rows, export_gate_report, all_quarantined_price_reference_rows,
     )
+    # Remove obsolete split CSV exports; their exact records remain available in
+    # the canonical catalog CSV, workbook sheets and full audit file.
+    for obsolete_path in (
+        RUNTIME_DIR / "promo_catalog_multisource_confirmed.csv",
+        RUNTIME_DIR / "promo_catalog_multisource_review.csv",
+    ):
+        try:
+            obsolete_path.unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"Peringatan: file audit duplikat lama tidak dapat dihapus ({obsolete_path.name}): {exc}")
+    print(f"Waktu ekspor CSV + Excel: {time.perf_counter() - export_started:.2f} detik", flush=True)
 
     discount_basis = Counter(r.get("discount_percent_basis") or "not_available" for r in current)
     merchant_counts = Counter(r.get("merchant_name") or "UNKNOWN" for r in current)
@@ -4959,7 +4991,7 @@ def main():
             OUT_SIMPLE_CSV.name: "Kolom dan nilai tampilan identik dengan sheet Promo pada workbook Excel; promo aktif yang masih perlu review terpisah di sheet Promo Aktif - Review.",
             OUT_XLSX.name: "Workbook ringkas untuk penggunaan harian serta sheet audit teknis tersembunyi.",
         },
-        "internal_audit_files": [OUT_CONFIRMED.relative_to(ROOT_DIR).as_posix(), OUT_REVIEW.relative_to(ROOT_DIR).as_posix(), OUT_FULL.relative_to(ROOT_DIR).as_posix(), OUT_REJECTED_PRODUCTS.relative_to(ROOT_DIR).as_posix(), OUT_GATE_REPORT.relative_to(ROOT_DIR).as_posix(), OUT_PRICE_REFERENCE_QUARANTINE.relative_to(ROOT_DIR).as_posix(), OUT_PRICE_MATCH_CANDIDATES.relative_to(ROOT_DIR).as_posix(), OUT_REPORT.relative_to(ROOT_DIR).as_posix()],
+        "internal_audit_files": [OUT_FULL.relative_to(ROOT_DIR).as_posix(), OUT_REJECTED_PRODUCTS.relative_to(ROOT_DIR).as_posix(), OUT_GATE_REPORT.relative_to(ROOT_DIR).as_posix(), OUT_PRICE_REFERENCE_QUARANTINE.relative_to(ROOT_DIR).as_posix(), OUT_PRICE_MATCH_CANDIDATES.relative_to(ROOT_DIR).as_posix(), OUT_REPORT.relative_to(ROOT_DIR).as_posix()],
         "clean_catalog_columns": [label for label, _ in CLEAN_COLUMNS],
         "full_audit_file": OUT_FULL.name,
         "discount_policy": {
@@ -5013,6 +5045,7 @@ def main():
     print("Kelompok variasi nama produk:", len(name_variant_rows))
     print("Kandidat duplikat untuk diperiksa:", len(possible_duplicate_rows))
     print("CSV kandidat duplikat:", OUT_POSSIBLE_DUPES.relative_to(ROOT_DIR))
+    print(f"Total waktu LIVE 3/4: {time.perf_counter() - pipeline_started:.2f} detik", flush=True)
 
 
 if __name__ == "__main__":

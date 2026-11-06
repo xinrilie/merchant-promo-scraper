@@ -1,18 +1,20 @@
 # Merchant Promo Scraper
 
-Versi source: **v12** — alur review kandidat SKU manual, normalisasi merek/ukuran/varian/jenis kemasan yang lebih ketat, pemisahan fresh vs carry-forward pada katalog harian, dan antrean harga yang tetap menyimpan kandidat di luar katalog utama. Lihat [CHANGELOG.md](CHANGELOG.md) dan [AUDIT_UPGRADE_V12.md](AUDIT_UPGRADE_V12.md).
+Proyek ini memiliki review kandidat SKU secara manual, pencocokan identitas produk yang konservatif, pemisahan data fresh dan carry-forward, serta antrean harga yang tetap menyimpan kandidat di luar katalog utama. Riwayat perubahan ringkas tersedia di [CHANGELOG.md](CHANGELOG.md).
 
 Pipeline Python untuk mengambil data promo dari halaman publik Hemat.id, Katalogpromosi.com, dan Scanharga.com. Proyek ini mengambil teks/HTML serta metadata gambar yang tersedia di halaman. **Poster hanya direferensikan lewat URL; gambar tidak dibaca, tidak di-OCR, dan tidak dipakai untuk menebak harga.**
 
-## Perubahan v10 — integritas referensi harga & laporan katalog
+## Integritas referensi harga dan laporan katalog
 
 - Referensi harga Hemat yang merchant-nya bertentangan dengan retailer pada URL katalog tidak lagi dipakai untuk pencocokan harga. Baris lama disimpan dalam `runtime/price_reference_quarantine.csv` dan ditampilkan pada sheet `Referensi Dikarantina`.
 - Karantina bersifat persisten: workbook run berikutnya tetap menampilkan seluruh record karantina sebelumnya walaupun tidak ada konflik baru pada run tersebut.
 - Sheet `Promo`, `Promo Aktif - Review`, dan `Perlu Diperiksa` dibuat saling eksklusif. Laporan JSON dan console menunjukkan jumlah tiap bucket agar overlap dapat direkonsiliasi. Sheet detail `Aktif`/`Perlu Review` tetap disimpan untuk audit lengkap.
-- Freshness dicatat per sumber untuk produk lintas-sumber. `fresh_deduplicated_offer_records`, jumlah baris unik dengan sumber fresh, atribusi fresh per sumber, dan overlap atribusi kini dilaporkan terpisah.
+- Freshness dicatat per sumber untuk produk lintas-sumber. `fresh_deduplicated_offer_records`, jumlah baris unik dengan sumber fresh, atribusi fresh per sumber, dan overlap atribusi dilaporkan terpisah.
+- LIVE 3/4 memakai indeks SKU yang dinormalisasi sekali per batch dan pencarian kandidat berbasis token terbalik. Console menampilkan waktu pencocokan, pembandingan harga, gerbang kualitas, dan ekspor agar tahap yang lambat mudah diidentifikasi.
+- Snapshot sumber hanya ditulis ke `runtime/promo_multisource_products_all.csv`. CSV split `active`/`review` dan CSV confirmed/review turunan tidak lagi dibuat karena menduplikasi snapshot utama dan tab workbook.
 - Pencocokan referensi tetap konservatif: identitas produk, ukuran, varian, retailer/kanal, dan umur data wajib cocok. Tidak ada fuzzy matching otomatis yang dapat menggabungkan SKU berbeda.
 
-## Perubahan v11 — Smart SKU Matching
+## Pencocokan SKU dan kandidat review
 
 - Pencocokan referensi harga tetap exact, tetapi kini memahami satuan metrik yang ekuivalen: `1,8 L` = `1800 ml`, `1 kg` = `1000 g`, dan `2 x 0,5 L` = `2 x 500 ml`.
 - Struktur kemasan tetap dibedakan: `2 x 500 ml` tidak disamakan dengan `1 L`, dan `10 x 27 g` tidak disamakan dengan `270 g`.
@@ -30,7 +32,7 @@ Sari Wangi Teh Celup 25 bags,SariWangi Teh Celup 25 bags,true,Penulisan merek di
 
 Jangan menambahkan alias hanya karena dua nama terlihat mirip. Pastikan merek, model, varian, ukuran, isi/pack, jenis kemasan, dan konteks produknya benar-benar sama. Baris dengan `approved` selain `true/yes/1/approved/setuju`, konflik alias, ukuran/varian/kemasan berbeda, atau bukti yang tidak memadai akan diabaikan. Kolom `note` lama tetap dapat dibaca untuk menjaga kompatibilitas file kurasi terdahulu.
 
-## Perubahan v12 — SKU review, freshness, dan antrean harga yang tidak membuang kandidat
+## Review SKU, freshness, dan antrean harga
 
 - Kandidat fuzzy dari `runtime/price_reference_match_candidates.csv` sekarang dapat diekspor ke `output/Review_Kandidat_SKU.xlsx`. Setiap kandidat diperiksa dengan merek terkurasi, ukuran/isi, varian, jenis kemasan, merchant pembanding, URL, dan umur data.
 - Merek yang diketahui berbeda, ukuran alternatif yang ambigu, varian berbeda, atau jenis kemasan yang bertentangan diklasifikasikan sebagai `TOLAK`. Kandidat lain hanya berstatus `BELUM DIREVIEW`; tidak ada harga yang otomatis dipasang ke produk.
@@ -64,7 +66,7 @@ Jangan menambahkan alias hanya karena dua nama terlihat mirip. Pastikan merek, m
 
 
 
-### Integritas status promo, merchant, dan identitas produk (v9)
+### Integritas status promo, merchant, dan identitas produk
 
 - Label `Expired`/`Kedaluwarsa` yang ditemukan pada konteks kartu produk disimpan sebagai bukti sumber dan mengalahkan tanggal akhir yang hanya hasil estimasi. Penawaran tersebut tidak dibawa kembali ke snapshot aktif.
 - Konteks kartu Hemat dibatasi agar label status dari kartu tetangga tidak bocor ke produk lain.
@@ -113,7 +115,6 @@ Buat ulang workbook pencarian harga secara offline dari snapshot yang sudah ada,
 ```bat
 run.bat --prepare-price-research
 run.bat --import-price-research
-run.bat --rebuild-from-last-snapshot
 ```
 
 Bangun ulang katalog dari snapshot terakhir tanpa mengulang scraping live (berguna setelah memperbarui aturan validasi/normalisasi):

@@ -174,8 +174,6 @@ def test_collector_main_migrates_snapshot_and_keeps_unseen_valid_rows(tmp_path, 
     monkeypatch.setattr(collector, "HISTORY_PATH", state / "promo_history.csv")
     monkeypatch.setattr(collector, "OUT_HISTORY", output / "Riwayat_Promo.csv")
     monkeypatch.setattr(collector, "OUT_ALL", runtime / "promo_multisource_products_all.csv")
-    monkeypatch.setattr(collector, "OUT_ACTIVE", runtime / "promo_multisource_products_active.csv")
-    monkeypatch.setattr(collector, "OUT_REVIEW", runtime / "promo_multisource_products_review.csv")
     monkeypatch.setattr(collector, "OUT_ARTICLES", runtime / "promo_multisource_articles.csv")
     monkeypatch.setattr(collector, "OUT_IMAGES", runtime / "promo_multisource_catalog_images.csv")
     monkeypatch.setattr(collector, "OUT_LOG", runtime / "promo_multisource_runlog.json")
@@ -199,6 +197,10 @@ def test_collector_main_migrates_snapshot_and_keeps_unseen_valid_rows(tmp_path, 
     history_rows = history.load_history(state / "promo_history.csv")
     assert len(history_rows) == 2
     assert (output / "Riwayat_Promo.csv").is_file()
+    # The complete all-products snapshot is canonical; duplicate active/review
+    # CSV exports are no longer generated.
+    assert not (runtime / "promo_multisource_products_active.csv").exists()
+    assert not (runtime / "promo_multisource_products_review.csv").exists()
 
 
 def test_collector_main_keeps_expired_rows_in_history_not_current_snapshot(tmp_path, monkeypatch):
@@ -233,8 +235,6 @@ def test_collector_main_keeps_expired_rows_in_history_not_current_snapshot(tmp_p
     monkeypatch.setattr(collector, "HISTORY_PATH", state / "promo_history.csv")
     monkeypatch.setattr(collector, "OUT_HISTORY", output / "Riwayat_Promo.csv")
     monkeypatch.setattr(collector, "OUT_ALL", runtime / "promo_multisource_products_all.csv")
-    monkeypatch.setattr(collector, "OUT_ACTIVE", runtime / "promo_multisource_products_active.csv")
-    monkeypatch.setattr(collector, "OUT_REVIEW", runtime / "promo_multisource_products_review.csv")
     monkeypatch.setattr(collector, "OUT_ARTICLES", runtime / "promo_multisource_articles.csv")
     monkeypatch.setattr(collector, "OUT_IMAGES", runtime / "promo_multisource_catalog_images.csv")
     monkeypatch.setattr(collector, "OUT_LOG", runtime / "promo_multisource_runlog.json")
@@ -285,8 +285,6 @@ def test_collector_does_not_overwrite_last_good_snapshot_when_all_sources_empty(
     monkeypatch.setattr(collector, "HISTORY_PATH", state / "promo_history.csv")
     monkeypatch.setattr(collector, "OUT_HISTORY", output / "Riwayat_Promo.csv")
     monkeypatch.setattr(collector, "OUT_ALL", runtime / "promo_multisource_products_all.csv")
-    monkeypatch.setattr(collector, "OUT_ACTIVE", runtime / "promo_multisource_products_active.csv")
-    monkeypatch.setattr(collector, "OUT_REVIEW", runtime / "promo_multisource_products_review.csv")
     monkeypatch.setattr(collector, "OUT_ARTICLES", runtime / "promo_multisource_articles.csv")
     monkeypatch.setattr(collector, "OUT_IMAGES", runtime / "promo_multisource_catalog_images.csv")
     monkeypatch.setattr(collector, "OUT_LOG", runtime / "promo_multisource_runlog.json")

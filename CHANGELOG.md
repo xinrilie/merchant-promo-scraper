@@ -1,65 +1,16 @@
-# Changelog
-## v12 — Human-reviewed SKU matching & catalogue workflow
-- Add `output/Review_Kandidat_SKU.xlsx` as a manual workflow for fuzzy SKU suggestions. Candidate classification now checks curated brand identity, exact normalized package size, variant markers, explicit package type, merchant scope and reference age.
-- Reject known brand conflicts, alternative/ambiguous package sizes, different variants and conflicting package types. Every other candidate remains manual-review only; no fuzzy candidate can attach a price automatically.
-- Distinguish same-merchant evidence from cross-merchant market-reference-only candidates. Manual alias approval is recorded only after reviewer decision; unknown brands require a direct identity-evidence URL and reviewer note.
-- Preserve reviewer decisions on workbook rebuilds while candidate identity (including current price/date/source URL) remains unchanged. Importer supports old `note` alias CSVs and writes the expanded `verification_note`/`evidence_url` format.
-- Separate the daily catalogue into mutually exclusive fresh-clean, fresh-review, carried-forward, and review-only buckets. Reconcile `Mulai Di Sini` totals against these tabs; concise CSV output includes only fresh-clean offers.
-- Keep eligible price-search candidates outside the main catalogue in a separate `Di Luar Katalog` sheet instead of dropping them. Existing manual fields in this sheet survive regeneration; these rows are review-only and are not imported automatically.
-- Add launcher modes `--export-sku-review` and `--import-sku-review`; rebuild and normal pipeline refresh the review workbook. Fix legacy batch rebuild flow and duplicate/incorrect jump labels.
-- Add regression coverage for brand, unit/package, variant and packaging conflicts; cross-merchant scope; stale references; alias approval/rejection; candidate workbook decision persistence; fresh/preserved sheet partitions; out-of-catalog price-search persistence; and launcher routing.
+# Riwayat Perubahan
 
+## 6 November 2026
+- Percepatan pencocokan referensi harga dengan indeks SKU yang dinormalisasi sekali per batch, bukan menormalisasi seluruh referensi untuk setiap baris katalog.
+- Pencarian kandidat SKU memakai inverted token index agar hanya membandingkan referensi yang memiliki token produk yang relevan. Kandidat fuzzy tetap untuk review dan tidak pernah memasang harga otomatis.
+- LIVE 3/4 kini menampilkan durasi pembaruan database, pencocokan SKU, pembandingan harga, quality gate, ekspor, dan total proses.
+- Menghapus ekspor CSV aktif/review mentah yang menduplikasi snapshot utama, serta CSV confirmed/review turunan yang sudah tersedia di workbook dan audit penuh.
+- Workbook tidak lagi membuat tab audit penuh yang menduplikasi CSV katalog lengkap; pemformatan sel dibuat lebih efisien dengan style yang dipakai ulang.
+- Nama file tes dibuat deskriptif tanpa akhiran nomor rilis.
 
-## v11 — Smart SKU matching & review-only candidates
-- Add canonical physical-unit matching for exact SKU references (e.g. 1.8 L and 1800 ml; 1 kg and 1000 g) while preserving multipack structure so 2 x 500 ml never collapses to 1 L.
-- Apply the same exact unit-normalized product identity to manual market references and normal-price estimates.
-- Add an optional curated alias file at `config/product_name_aliases.csv`; only approved aliases with identical package and variant signatures are loaded. The file is empty by default.
-- Add review-only near-match suggestions at `runtime/price_reference_match_candidates.csv`, including similarity, size/variant/merchant flags, source URL and reason. These suggestions never attach a price or calculate a discount.
-- Report separate counts for reordered-token, unit-normalized and approved-alias exact matches.
-- Add regression tests for unit conversions, multipack boundaries, variant protection, approved aliases, market-reference matching and non-automatic fuzzy suggestions.
-
-## v10 — Reference integrity & workbook reconciliation
-- Quarantine legacy Hemat price-reference records when the merchant is outside the retailer scope explicitly named by a comparison/catalogue URL; invalid records are excluded from matching rather than silently trusted.
-- Keep the quarantine ledger persistent in `runtime/price_reference_quarantine.csv` and show all prior/current quarantined records in the visible `Referensi Dikarantina` workbook sheet on subsequent runs.
-- Make the everyday workbook buckets mutually exclusive: clean active offers, active offers requiring review, and review-only non-active offers. Add reconciled bucket totals to console and JSON reports.
-- Preserve per-source freshness provenance through cross-source deduplication and expose fresh unique offer rows, per-source fresh attributions, preserved attributions, and cross-source overlap in collector/health reports.
-- Keep product-reference matching strict on normalized SKU, size, variant, retailer/merchant, region/channel, and age; no fuzzy SKU merge is introduced.
-- Add regression tests for persistent quarantine, merchant-scope rejection, cross-source freshness attribution, and non-overlapping review partitions.
-
-## v9 — Promo status & source identity integrity
-- Explicit source-side `Expired`/`Kedaluwarsa` labels are preserved as evidence and take precedence over estimated future end dates. These offers remain in history but are excluded from the current active snapshot.
-- Hemat card-context extraction now stops before neighboring price-bearing product cards, preventing status/merchant labels from leaking between cards.
-- Hemat retailer attribution prefers an explicit retailer prefix in the item-detail URL over a comparison-page wrapper label; generic category URLs do not trigger merchant guesses.
-- Leading `None`, `null`, `undefined`, `nan`, and `n/a` brand placeholders are removed from normalized product names while raw source text remains available for audit.
-- Conflicting estimated date windows for the same merchant/product/offer are quarantined as `unknown` for manual review instead of silently extending promo validity.
-- Explicit expired and active offers are not cross-source merged; equivalent expired observations can still be consolidated historically.
-- Added `run.bat --rebuild-from-last-snapshot` to reprocess an existing collector snapshot after a code/validation update without repeating live scraping.
-- Added regression coverage for the Alfamart diaper merchant mismatch, explicit expired cards, adjacent-card status isolation, placeholder brands, conflicting estimated dates, and history carry-forward.
-
-## v8 — Source freshness, retention & price-reference matching audit
-- Added source-specific carry-forward windows: Hemat.id 21 days, Katalogpromosi.com 14 days, Scanharga.com 7 days; offers with independent evidence from multiple sources use the longest applicable window.
-- Unknown-period offers are kept only within the shorter of the 14-day review grace and the source retention window. Stale/unverified offers remain in permanent history with explicit presence and retention reasons, but leave the current snapshot.
-- Scanharga is dynamically labelled `discovery_support` when a run finds at least 10 article pages, no more than 5 fresh textual product rows, and image references. Its articles/images remain discoverable without treating posters as product-price evidence.
-- Source health now reports article count, text-bearing article count, product rows extracted from articles, image references, and fresh product yield per article; console output includes each source's role and explanation.
-- Clarified run metrics so raw extraction rows, fresh deduplicated offers, carried-forward rows, pre-quality-gate active candidates, and post-quality-gate catalogue counts are not conflated.
-- Price-reference matching now accepts exact token sets regardless of word order, but continues to require exact size/variant and region/channel signatures. Added diagnostics for SKU, size, variant, scope, and stale-reference mismatches.
-- Added regression coverage for source-specific retention, multi-source retention, discovery-role reporting, and safe price identity matching.
-
-## v7.1 — Hemat source routing & source URL display fix
-- Replaced the two Hemat seed URLs with seven verified single-retailer catalogue URLs: Alfamart, Indomaret, Alfamidi, Super Indo, Hypermart, Yogya, and Tip Top.
-- Hemat listing discovery now accepts only configured single-retailer slugs (including the retailer-specific `/promo-promo/` route), rejecting multi-retailer comparison pages and unsupported retailer slugs.
-- Added `preferred_source_url()` for clean catalogue display: prefer valid Hemat product/category detail URLs; otherwise use the identified retailer's single-retailer catalogue; preserve original URL for unknown merchants and non-Hemat sources.
-- Applied the preferred URL to both the full clean catalogue and concise Excel/CSV output while preserving original source URLs in raw snapshot/audit provenance.
-- Added nine regression tests for seed coverage, listing discovery filters, item URL preference, merchant fallback, and both catalogue exports.
-- Fixed Hemat legacy product detail links using `/harga-<slug>/` (in addition to `/harga/<slug>/` and `/katalog/<slug>/`); rebuilt the local catalogue so no displayed Hemat `Sumber URL` remains a comma-separated comparison route.
-- Added an additional regression test for the legacy hyphenated detail URL pattern.
-
-## v7 — Manual price verification & normal-price estimate
-- Tokku is supported as a small-volume, manual verification source only; no automated Tokku collection is added.
-- Manual workbook now captures retailer, source-side last-checked date, price classification, and exact SKU-match status.
-- Stale Tokku observations older than 30 days are retained for audit but excluded from current normal-price estimates and market comparisons.
-- Added a separate estimated-normal-market-price output, range, provenance, age, and confidence. This never overwrites the source's original/normal price or official discount calculation.
-- Three-month Hemat historical averages are a low-confidence fallback and are not labelled as original price. Promo/unknown/historical-minimum records are not used as normal-price estimates.
-- Moved mutable market-reference observations to `state/product_market_price_reference.csv`, with one-time migration from the tracked `data/` seed.
-- Added `run.bat --prepare-price-research` for offline workbook regeneration.
-- Added `run.bat --import-price-research` to import checked references, rebuild the catalog from the last snapshot without live scraping, refresh the workbook, and verify outputs with the launcher-selected interpreter.
+## Fitur yang dipertahankan
+- Scraping teks/HTML dan pencatatan URL gambar tanpa OCR.
+- Riwayat promo permanen, carry-forward berbatas waktu, dan pemisahan expired dari katalog aktif.
+- Validasi bukti harga, merchant, periode, kategori, dan quality gate sebelum ekspor.
+- Referensi harga manual, karantina referensi bermasalah, alias SKU yang disetujui, dan kandidat pencocokan fuzzy untuk review.
+- Launcher Windows yang memakai Python global dan tidak membuat virtual environment atau memasang dependency otomatis.

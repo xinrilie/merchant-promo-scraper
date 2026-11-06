@@ -398,6 +398,80 @@ def update_reference_database(
         "update_policy": "latest_price_replaces_previous_per_product_merchant_channel",
     }
 
+class PreparedReferenceIndex:
+    """One-time normalized reference index shared by exact lookup and review suggestions.
+
+    The previous implementation normalized every reference for every product query.
+    This object computes SKU keys, package/variant signatures, dates and merchant
+    scope once, then uses dictionaries/inverted token lists for each lookup.
+    """
+
+    def __init__(self, records: list[dict], aliases: dict[str, str] | None = None):
+        from collections import defaultdict
+
+        self.aliases = aliases or {}
+        self.records: list[dict] = []
+        self.by_exact: dict[str, list[dict]] = defaultdict(list)
+        self.by_tokens: dict[str, list[dict]] = defaultdict(list)
+        self.by_unit_normalized: dict[str, list[dict]] = defaultdict(list)
+        self.by_approved_alias: dict[str, list[dict]] = defaultdict(list)
+        self.by_core: dict[str, list[dict]] = defaultdict(list)
+        self.by_candidate_token: dict[str, list[dict]] = defaultdict(list)
+
+        for position, raw in enumerate(records):
+            row = _normalize_record(raw)
+            product = row.get("product_text") or ""
+            if not product:
+                continue
+            exact_key = identity_key(product)
+            token_key = identity_token_key(product)
+            unit_key = product_name_matching_key(product)
+            alias_key = product_name_matching_key(product, self.aliases)
+            core_key = identity_core_key(product)
+            tokens = set(re.findall(r"[a-z0-9]+", exact_key))
+            item = {
+                "position": position,
+                "row": row,
+                "candidate_text": clean_product_name(product),
+                "exact_key": exact_key,
+                "token_key": token_key,
+                "unit_key": unit_key,
+                "alias_key": alias_key,
+                "core_key": core_key,
+                "tokens": tokens,
+                "package_signature": product_name_package_match_signature(product),
+                "variant_signature": row.get("variant_signature", ""),
+                "merchant_key": merchant_key(row.get("merchant_name")),
+                "channel_key": merchant_key(row.get("region_or_channel")),
+                "observed_date": _parse_date(row.get("observed_at")),
+                "timestamp_sort": _timestamp_sort_key(row.get("observed_at")),
+                "normal_price": _price_int(row.get("normal_price")),
+                "normal_price_low": _price_int(row.get("normal_price_low")),
+                "normal_price_high": _price_int(row.get("normal_price_high")),
+            }
+            self.records.append(item)
+            if exact_key:
+                self.by_exact[exact_key].append(item)
+            if token_key:
+                self.by_tokens[token_key].append(item)
+            if unit_key:
+                self.by_unit_normalized[unit_key].append(item)
+            if alias_key:
+                self.by_approved_alias[alias_key].append(item)
+            if core_key:
+                self.by_core[core_key].append(item)
+            if len(tokens) >= 2:
+                for token in tokens:
+                    self.by_candidate_token[token].append(item)
+
+
+def prepare_reference_lookup_index(
+    records: list[dict], aliases: dict[str, str] | None = None,
+) -> PreparedReferenceIndex:
+    """Precompute exact SKU indexes once for a batch of product rows."""
+    return PreparedReferenceIndex(records, aliases=aliases)
+
+
 def find_reference_price(
     records: list[dict],
     product_text: object,
@@ -406,64 +480,53 @@ def find_reference_price(
     max_age_days: int = PRICE_REFERENCE_MAX_AGE_DAYS,
     region_or_channel: object = None,
     aliases: dict[str, str] | None = None,
+    prepared_index: PreparedReferenceIndex | None = None,
 ) -> dict:
-    """Find an exact SKU reference using conservative, unit-aware identity matching.
-
-    Matching levels are exact normalized text, exact token reorder, equivalent
-    physical-unit notation (e.g. 1.8 L == 1800 ml), and explicitly approved manual
-    aliases. Brand, variant, model tokens and multipack structure remain mandatory.
-    Fuzzy similarity is never sufficient to attach a price.
-    """
+    """Find an exact SKU reference through precomputed indexes; never fuzzy-attach."""
     pkey = identity_key(product_text)
     token_key = identity_token_key(product_text)
     core_key = identity_core_key(product_text)
     raw_match_key = product_name_matching_key(product_text)
     approved_match_key = product_name_matching_key(product_text, aliases)
     mkey = merchant_key(merchant_name)
+    channel_key = merchant_key(region_or_channel)
     variant = "|".join(sorted(product_name_variant_signature(product_text)))
     package_signature = product_name_package_match_signature(product_text)
     if not pkey:
         return {"status": "identity_unavailable", "diagnostic": "identity_unavailable"}
-    channel_key = merchant_key(region_or_channel)
 
-    identity_candidates: list[tuple[dict, str]] = []
-    core_candidates: list[dict] = []
-    for record in records:
-        row = _normalize_record(record)
-        row_product = row.get("product_text") or ""
-        row_key = identity_key(row_product)
-        row_token_key = identity_token_key(row_product)
-        row_core_key = identity_core_key(row_product)
-        row_raw_match_key = product_name_matching_key(row_product)
-        row_approved_match_key = product_name_matching_key(row_product, aliases)
-        if row_core_key and row_core_key == core_key:
-            core_candidates.append(row)
-        if row_key == pkey:
-            identity_candidates.append((row, "exact_normalized"))
-        elif row_token_key and row_token_key == token_key:
-            identity_candidates.append((row, "exact_tokens_reordered"))
-        elif row_raw_match_key and row_raw_match_key == raw_match_key:
-            identity_candidates.append((row, "exact_unit_normalized"))
-        elif aliases and row_approved_match_key and row_approved_match_key == approved_match_key:
-            identity_candidates.append((row, "approved_manual_alias"))
+    index = prepared_index or prepare_reference_lookup_index(records, aliases=aliases)
+
+    # Preserve the old matching precedence per reference row: exact normalized,
+    # reordered exact tokens, equivalent-unit notation, then approved alias.
+    identity_by_position: dict[int, tuple[dict, str]] = {}
+    for lookup, key, method in (
+        (index.by_exact, pkey, "exact_normalized"),
+        (index.by_tokens, token_key, "exact_tokens_reordered"),
+        (index.by_unit_normalized, raw_match_key, "exact_unit_normalized"),
+        (index.by_approved_alias, approved_match_key, "approved_manual_alias"),
+    ):
+        if not key:
+            continue
+        for item in lookup.get(key, ()):
+            identity_by_position.setdefault(item["position"], (item, method))
+    identity_candidates = sorted(identity_by_position.values(), key=lambda pair: pair[0]["position"])
+    core_candidates = index.by_core.get(core_key, ()) if core_key else ()
 
     exact_product: list[tuple[dict, str]] = []
     unusable_timestamp_candidates = 0
     size_variant_candidates: list[tuple[dict, str]] = []
-    for row, method in identity_candidates:
-        row_product = row.get("product_text") or ""
-        # Compare canonical package signatures instead of raw strings so equivalent
-        # metric notation matches, while pack count and pack-vs-single stay distinct.
-        if product_name_package_match_signature(row_product) != package_signature:
+    for item, method in identity_candidates:
+        if item["package_signature"] != package_signature:
             continue
-        if row.get("variant_signature", "") != variant:
+        if item["variant_signature"] != variant:
             continue
-        size_variant_candidates.append((row, method))
-        observed = _parse_date(row.get("observed_at"))
+        size_variant_candidates.append((item, method))
+        observed = item["observed_date"]
         if not observed or observed > today:
             unusable_timestamp_candidates += 1
             continue
-        exact_product.append((row, method))
+        exact_product.append((item, method))
 
     if not exact_product:
         if size_variant_candidates and unusable_timestamp_candidates:
@@ -471,17 +534,14 @@ def find_reference_price(
         elif identity_candidates:
             diagnostic = "size_or_variant_signature_mismatch"
         elif core_candidates:
-            size_matches = [
-                r for r in core_candidates
-                if product_name_package_match_signature(r.get("product_text")) == package_signature
-            ]
+            size_matches = [item for item in core_candidates if item["package_signature"] == package_signature]
             if not size_matches:
                 diagnostic = "product_size_mismatch"
             else:
-                variant_matches = [r for r in size_matches if r.get("variant_signature", "") == variant]
+                variant_matches = [item for item in size_matches if item["variant_signature"] == variant]
                 if not variant_matches:
                     diagnostic = "product_variant_mismatch"
-                elif not any(merchant_key(r.get("region_or_channel")) == channel_key for r in variant_matches):
+                elif not any(item["channel_key"] == channel_key for item in variant_matches):
                     diagnostic = "region_or_channel_mismatch"
                 else:
                     diagnostic = "identity_normalization_mismatch"
@@ -489,31 +549,25 @@ def find_reference_price(
             diagnostic = "no_product_identity_candidate"
         return {"status": "no_exact_match", "diagnostic": diagnostic, "max_age_days": max_age_days}
 
-    channel_candidates = [
-        (row, method) for row, method in exact_product
-        if merchant_key(row.get("region_or_channel")) == channel_key
-    ]
+    channel_candidates = [(item, method) for item, method in exact_product if item["channel_key"] == channel_key]
     if not channel_candidates:
-        return {
-            "status": "no_exact_match", "diagnostic": "region_or_channel_mismatch",
-            "max_age_days": max_age_days,
-        }
+        return {"status": "no_exact_match", "diagnostic": "region_or_channel_mismatch", "max_age_days": max_age_days}
 
-    same_merchant = [(r, method) for r, method in channel_candidates if merchant_key(r.get("merchant_name")) == mkey]
-    cross_merchant = [(r, method) for r, method in channel_candidates if merchant_key(r.get("merchant_name")) != mkey]
+    same_merchant = [(item, method) for item, method in channel_candidates if item["merchant_key"] == mkey]
+    cross_merchant = [(item, method) for item, method in channel_candidates if item["merchant_key"] != mkey]
 
     def choose(candidates: list[tuple[dict, str]], scope: str) -> dict | None:
         if not candidates:
             return None
         fresh_candidates = [
-            (row, method) for row, method in candidates
-            if (today - _parse_date(row.get("observed_at"))).days <= max_age_days
+            (item, method) for item, method in candidates
+            if item["observed_date"] and (today - item["observed_date"]).days <= max_age_days
         ]
         if fresh_candidates:
             candidates = fresh_candidates
-        latest_sort = max(_timestamp_sort_key(row.get("observed_at")) for row, _ in candidates)
-        latest = [(row, method) for row, method in candidates if _timestamp_sort_key(row.get("observed_at")) == latest_sort]
-        latest_date = max(_parse_date(row.get("observed_at")) for row, _ in latest if _parse_date(row.get("observed_at")))
+        latest_sort = max(item["timestamp_sort"] for item, _ in candidates)
+        latest = [(item, method) for item, method in candidates if item["timestamp_sort"] == latest_sort]
+        latest_date = max(item["observed_date"] for item, _ in latest if item["observed_date"])
         age = (today - latest_date).days
         if age > max_age_days:
             return {
@@ -522,13 +576,13 @@ def find_reference_price(
                 "observed_at": latest_date.isoformat(), "match_scope": scope,
             }
         manual = [
-            (row, method) for row, method in latest
-            if row.get("record_origin", "").casefold() == "manual_verified"
-            and row.get("verification_status", "").casefold() == "retailer_official"
+            (item, method) for item, method in latest
+            if item["row"].get("record_origin", "").casefold() == "manual_verified"
+            and item["row"].get("verification_status", "").casefold() == "retailer_official"
         ]
         if manual:
             latest = manual
-        prices = {_price_int(row.get("normal_price")) for row, _ in latest}
+        prices = {item["normal_price"] for item, _ in latest}
         prices.discard(None)
         if len(prices) != 1:
             return {
@@ -537,28 +591,29 @@ def find_reference_price(
             }
         chosen_price = next(iter(prices))
         chosen, method = sorted(latest, key=lambda pair: (
-            pair[0].get("record_origin") != "manual_verified",
-            pair[0].get("source_name", "").casefold(),
-            pair[0].get("source_url", ""),
+            pair[0]["row"].get("record_origin") != "manual_verified",
+            pair[0]["row"].get("source_name", "").casefold(),
+            pair[0]["row"].get("source_url", ""),
         ))[0]
+        row = chosen["row"]
         return {
             "status": "matched_recent_exact" if scope == "same_merchant" else "matched_recent_cross_merchant",
             "diagnostic": "matched_exact_sku",
             "identity_match_method": method,
             "match_scope": scope,
             "normal_price": chosen_price,
-            "merchant_name": chosen.get("merchant_name"),
-            "observed_at": chosen.get("observed_at") or latest_date.isoformat(),
+            "merchant_name": row.get("merchant_name"),
+            "observed_at": row.get("observed_at") or latest_date.isoformat(),
             "age_days": age,
-            "source_name": chosen.get("source_name"),
-            "source_url": chosen.get("source_url"),
-            "evidence_text": chosen.get("evidence_text"),
-            "verification_status": chosen.get("verification_status"),
-            "record_origin": chosen.get("record_origin"),
-            "normal_price_low": _price_int(chosen.get("normal_price_low")) or chosen_price,
-            "normal_price_high": _price_int(chosen.get("normal_price_high")) or chosen_price,
-            "price_unit": chosen.get("price_unit", ""),
-            "reference_note": chosen.get("reference_note", ""),
+            "source_name": row.get("source_name"),
+            "source_url": row.get("source_url"),
+            "evidence_text": row.get("evidence_text"),
+            "verification_status": row.get("verification_status"),
+            "record_origin": row.get("record_origin"),
+            "normal_price_low": chosen["normal_price_low"] or chosen_price,
+            "normal_price_high": chosen["normal_price_high"] or chosen_price,
+            "price_unit": row.get("price_unit", ""),
+            "reference_note": row.get("reference_note", ""),
             "max_age_days": max_age_days,
         }
 
@@ -581,10 +636,7 @@ def find_reference_price(
         return own_match
     if other_match:
         return other_match
-    return {
-        "status": "no_exact_match", "diagnostic": "no_merchant_reference_candidate",
-        "max_age_days": max_age_days,
-    }
+    return {"status": "no_exact_match", "diagnostic": "no_merchant_reference_candidate", "max_age_days": max_age_days}
 
 
 PRICE_MATCH_CANDIDATE_FIELDS = [
@@ -597,32 +649,19 @@ PRICE_MATCH_CANDIDATE_FIELDS = [
 ]
 
 
-def prepare_reference_candidate_index(records: list[dict]) -> list[dict]:
-    """Pre-normalize reference metadata once for efficient review suggestions."""
-    prepared = []
-    for raw in records:
-        row = _normalize_record(raw)
-        candidate_text = clean_product_name(row.get("product_text"))
-        tokens = set(re.findall(r"[a-z0-9]+", identity_key(candidate_text)))
-        if not candidate_text or len(tokens) < 2:
-            continue
-        prepared.append({
-            "row": row,
-            "candidate_text": candidate_text,
-            "matching_key": product_name_matching_key(candidate_text),
-            "tokens": tokens,
-            "package_signature": product_name_package_match_signature(candidate_text),
-            "variant_signature": product_name_variant_signature(candidate_text),
-            "merchant_key": merchant_key(row.get("merchant_name")),
-        })
-    return prepared
+def prepare_reference_candidate_index(
+    records: list[dict], aliases: dict[str, str] | None = None,
+) -> PreparedReferenceIndex:
+    """Prepare exact-reference and inverted-token indexes once for the full batch."""
+    return prepare_reference_lookup_index(records, aliases=aliases)
 
 
 def suggest_reference_price_candidates(
     records: list[dict], product_text: object, merchant_name: object = "",
-    top_n: int = 3, min_similarity: float = 0.56, prepared_index: list[dict] | None = None,
+    top_n: int = 3, min_similarity: float = 0.56,
+    prepared_index: PreparedReferenceIndex | list[dict] | None = None,
 ) -> list[dict]:
-    """Return review-only near matches; these suggestions never attach prices."""
+    """Return review-only near matches using token postings; never attach prices."""
     query = clean_product_name(product_text)
     query_key = product_name_matching_key(query)
     query_tokens = set(re.findall(r"[a-z0-9]+", identity_key(query)))
@@ -630,30 +669,59 @@ def suggest_reference_price_candidates(
         return []
     query_package = product_name_package_match_signature(query)
     query_variant = product_name_variant_signature(query)
+    query_brand = product_name_brand_signature(query)
     query_merchant = merchant_key(merchant_name)
+
     prepared = prepared_index if prepared_index is not None else prepare_reference_candidate_index(records)
+    if isinstance(prepared, PreparedReferenceIndex):
+        # Inverted index: only inspect records sharing at least one query token.
+        possible: dict[int, dict] = {}
+        for token in query_tokens:
+            for item in prepared.by_candidate_token.get(token, ()):
+                possible[item["position"]] = item
+        candidate_items = possible.values()
+    else:
+        # Backward-compatible path for callers that supply a legacy list index.
+        candidate_items = prepared
+
     candidates = []
-    for item in prepared:
-        candidate_text = item["candidate_text"]
-        if item["matching_key"] == query_key:
+    for item in candidate_items:
+        candidate_text = item.get("candidate_text") or (item.get("row") or {}).get("product_text") or ""
+        matching_key = item.get("unit_key") or item.get("matching_key") or product_name_matching_key(candidate_text)
+        if matching_key == query_key:
             continue
-        shared = query_tokens & item["tokens"]
-        overlap = len(shared) / max(1, min(len(query_tokens), len(item["tokens"])))
+        tokens = item.get("tokens")
+        if tokens is None:
+            tokens = set(re.findall(r"[a-z0-9]+", identity_key(candidate_text)))
+        shared = query_tokens & tokens
+        overlap = len(shared) / max(1, min(len(query_tokens), len(tokens)))
         if len(shared) < 2 or overlap < 0.45:
             continue
         similarity = product_name_similarity(query, candidate_text)
         if similarity < min_similarity:
             continue
-        package_match = item["package_signature"] == query_package
-        variant_match = item["variant_signature"] == query_variant
-        query_brand = product_name_brand_signature(query)
-        candidate_brand = product_name_brand_signature(candidate_text)
+        package_signature = item.get("package_signature") or product_name_package_match_signature(candidate_text)
+        variant_signature = item.get("variant_signature")
+        if variant_signature is None:
+            variant_signature = product_name_variant_signature(candidate_text)
+        package_match = package_signature == query_package
+        variant_match = variant_signature == query_variant
+        candidate_brand = item.get("brand_signature")
+        if candidate_brand is None:
+            candidate_brand = product_name_brand_signature(candidate_text)
         brand_match_value = product_name_brand_match(query, candidate_text)
         brand_match = "unknown" if brand_match_value is None else str(brand_match_value).lower()
-        packaging_value = product_name_packaging_match(query, candidate_text)
+        packaging_value = item.get("packaging_match")
+        if packaging_value is None:
+            packaging_value = product_name_packaging_match(query, candidate_text)
         packaging_match = "unknown" if packaging_value is None else str(packaging_value).lower()
-        merchant_match = bool(query_merchant) and item["merchant_key"] == query_merchant
-        row = item["row"]
+        brand_match_value = None if brand_match == "unknown" else brand_match == "true"
+        packaging_match_value = None if packaging_match == "unknown" else packaging_match == "true"
+        merchant_value = item.get("merchant_key")
+        if merchant_value is None:
+            merchant_value = merchant_key((item.get("row") or {}).get("merchant_name"))
+        merchant_match = bool(query_merchant) and merchant_value == query_merchant
+        row = item.get("row") or item
         if brand_match == "false":
             classification = "reject_brand_mismatch"
             priority = "reject"
@@ -678,7 +746,6 @@ def suggest_reference_price_candidates(
             classification = "manual_review_brand_unknown"
             priority = "low"
             reason = "Merek tidak dapat diidentifikasi dengan aman; perlu verifikasi produk manual"
-        merchant_scope = "same_merchant" if merchant_match else "cross_merchant_market_reference_only"
         rank_score = (
             similarity + (0.14 if brand_match == "true" else 0.0)
             + (0.12 if package_match else 0.0) + (0.10 if variant_match else 0.0)
@@ -701,7 +768,7 @@ def suggest_reference_price_candidates(
             "variant_match": str(variant_match).lower(),
             "packaging_match": packaging_match,
             "merchant_match": str(merchant_match).lower(),
-            "merchant_scope": merchant_scope,
+            "merchant_scope": "same_merchant" if merchant_match else "cross_merchant_market_reference_only",
             "review_classification": classification,
             "review_priority": priority,
             "suggestion_reason": reason,
